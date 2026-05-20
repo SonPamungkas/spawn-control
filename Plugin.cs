@@ -72,6 +72,8 @@ namespace SpawnControl
         private static readonly AccessTools.FieldRef<Airbase, List<AircraftDefinition>> AirbaseAvailableAircraftRef =
             AccessTools.FieldRefAccess<Airbase, List<AircraftDefinition>>("availableAircraft");
 
+        // We now use the game's native, high-performance hangar.Available check.
+
         // Caches VTOL reflection checks by Aircraft unitName for maximum performance
         public static Dictionary<string, bool> VTOLCache = new Dictionary<string, bool>();
 
@@ -118,31 +120,55 @@ namespace SpawnControl
 
         private IEnumerator InitSpawnControlConfigs()
         {
-            Log.LogInfo("SpawnControl: Waiting for Blueprinter and all aircraft definitions to stabilize...");
+            Log.LogInfo("SpawnControl: Waiting for Blueprinter assets to load and stabilize...");
 
-            // 1. Wait until AircraftDefinition count stabilizes (ensuring all Blueprinter assets are fully loaded)
-            int lastCount = 0;
-            int stableTicks = 0;
-            while (stableTicks < 5)
+            // 1. Wait until both AircraftDefinition and UnitDefinition counts stabilize (non-zero and unchanging) with hard timeout
+            UnitDefinition[] allUnits = null;
+            AircraftDefinition[] allAircraft = null;
+
+            int stableCount = 0;
+            int lastUnitsCount = 0;
+            int lastAircraftCount = 0;
+            int waitSeconds = 0;
+
+            while (waitSeconds < 15) // 15 seconds safety timeout to prevent infinite hang at startup
             {
-                var currentAircraft = Resources.FindObjectsOfTypeAll<AircraftDefinition>();
-                int currentCount = currentAircraft != null ? currentAircraft.Length : 0;
-                if (currentCount > 0 && currentCount == lastCount)
+                allUnits = Resources.FindObjectsOfTypeAll<UnitDefinition>();
+                allAircraft = Resources.FindObjectsOfTypeAll<AircraftDefinition>();
+
+                int uCount = allUnits != null ? allUnits.Length : 0;
+                int aCount = allAircraft != null ? allAircraft.Length : 0;
+
+                if (uCount > 0 && aCount > 0)
                 {
-                    stableTicks++;
+                    if (uCount == lastUnitsCount && aCount == lastAircraftCount)
+                    {
+                        stableCount++;
+                        if (stableCount >= 3) // Stable for 3 seconds
+                        {
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        lastUnitsCount = uCount;
+                        lastAircraftCount = aCount;
+                        stableCount = 0;
+                    }
                 }
                 else
                 {
-                    lastCount = currentCount;
-                    stableTicks = 0;
+                    stableCount = 0;
                 }
+
+                waitSeconds++;
                 yield return new WaitForSeconds(1.0f);
             }
 
-            Log.LogInfo($"SpawnControl: Aircraft definitions stabilized at {lastCount}. Pre-generating hangar options...");
+            Log.LogInfo($"SpawnControl: Stable at {lastAircraftCount} aircraft and {lastUnitsCount} units. Pre-generating hangar options...");
 
-            var allUnits = Resources.FindObjectsOfTypeAll<UnitDefinition>();
-            var allAircraft = Resources.FindObjectsOfTypeAll<AircraftDefinition>();
+            allUnits = Resources.FindObjectsOfTypeAll<UnitDefinition>();
+            allAircraft = Resources.FindObjectsOfTypeAll<AircraftDefinition>();
 
             // 1. GATHER AND SORT ALL AIRCRAFT (These will become the Main Categories)
             var sortedAircraft = allAircraft
@@ -461,21 +487,57 @@ namespace SpawnControl
         // BAKED MODDED AIRCRAFT SPAWNER RULES
         // =========================================================================
 
+        // Matched against AircraftDefinition.unitName (display name — can be changed by other mods)
         private static readonly HashSet<string> VanillaAircraftKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
-            "CI-22 Cricket",
-            "SAH-46 Chicane",
-            "A-19 Brawler",
-            "Alkyon AB-4",
-            "T/A-30 Compass",
-            "FS-12 Revoker",
-            "EW-25 Medusa",
-            "UH-90 Ibis",
-            "FS-20 Vortex",
-            "KR-67 Ifrit",
-            "VL-49 Tarantula",
-            "SFB-81 Darkreach"
+            "CI-22 Cricket",      // COIN
+            "SAH-46 Chicane",     // AttackHelo1
+            "A-19 Brawler",       // CAS1
+            "Alkyon AB-4",        // FastBomber1
+            "T/A-30 Compass",     // Trainer
+            "FS-12 Revoker",      // Fighter1
+            "EW-25 Medusa",       // EW1
+            "UH-90 Ibis",         // UtilityHelo1
+            "FS-20 Vortex",       // SmallFighter1
+            "KR-67 Ifrit",        // Mulltirolle1
+            "VL-49 Tarantula",    // QuadVTOL1
+            "SFB-81 Darkreach",   // Darkreach
         };
+
+        // Matched against AircraftDefinition.name (prefab asset name — stable, never changed by mods)
+        // This is the fallback so vanilla aircraft are correctly identified even if another mod
+        // renames their unitName display string.
+        private static readonly HashSet<string> VanillaPrefabNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "COIN",
+            "AttackHelo1",
+            "CAS1",
+            "FastBomber1",
+            "Trainer",
+            "Fighter1",
+            "EW1",
+            "UtilityHelo1",
+            "SmallFighter1",
+            "Mulltirolle1",
+            "QuadVTOL1",
+            "Darkreach",
+        };
+
+        // Returns true if this AircraftDefinition is a vanilla aircraft, regardless
+        // of whether another mod has renamed its display unitName.
+        public static bool IsVanillaAircraft(AircraftDefinition ac)
+        {
+            if (ac == null) return false;
+            if (!string.IsNullOrEmpty(ac.unitName) && VanillaAircraftKeys.Contains(ac.unitName)) return true;
+            if (!string.IsNullOrEmpty(ac.name)     && VanillaPrefabNames.Contains(ac.name))     return true;
+            return false;
+        }
+
+        // 2. Check if this is a known modded aircraft
+        // (kept as separate variable to preserve caller context)
+        private static bool IsModdedAircraft(AircraftDefinition ac, string acKey)
+            => !IsVanillaAircraft(ac) && !VanillaAircraftKeys.Contains(acKey);
+
 
         private static readonly HashSet<string> VanillaShipNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -507,8 +569,8 @@ namespace SpawnControl
                 return IsVTOL(ac);
             }
 
-            // 2. Check if this is a known modded aircraft
-            bool isModded = !VanillaAircraftKeys.Contains(acKey);
+            // 2. Check if this is a known modded aircraft (checks both unitName and stable prefab name)
+            bool isModded = IsModdedAircraft(ac, acKey);
 
             if (isModded)
             {
@@ -783,14 +845,37 @@ namespace SpawnControl
             return false;
         }
 
-        public static AircraftDefinition[] GetAllowedAircraftForHangar(Hangar hangar)
+        // Filters a vanilla-provided aircraft array through our permission config.
+        // IMPORTANT: We must NEVER replace the vanilla result entirely — the vanilla
+        // result already has occupancy filtering applied (no spawning in occupied slots).
+        // We only remove aircraft that our config says are not allowed at this hangar.
+        public static AircraftDefinition[] FilterAllowedAircraft(Hangar hangar, AircraftDefinition[] vanillaResult)
+        {
+            if (hangar == null || vanillaResult == null) return vanillaResult;
+            if (AllowAllEverywhere.Value) return vanillaResult;
+
+            List<AircraftDefinition> allowed = new List<AircraftDefinition>(vanillaResult.Length);
+            for (int i = 0; i < vanillaResult.Length; i++)
+            {
+                var def = vanillaResult[i];
+                if (def == null) continue;
+                if (IsAircraftAllowed(hangar, def)) allowed.Add(def);
+            }
+            return allowed.ToArray();
+        }
+
+        // Builds the full permitted list for a hangar from the global aircraft pool.
+        // Used ONLY for GetAvailableAircraft when we need to ADD modded aircraft
+        // that the vanilla list omits entirely (not present in the native array).
+        // Occupancy is NOT checked here — this is for the display menu only.
+        public static AircraftDefinition[] GetAllAllowedAircraftForHangar(Hangar hangar)
         {
             if (hangar == null) return new AircraftDefinition[0];
-            
+
             var aircraftList = allAircraft.Count > 0 ? allAircraft : Resources.FindObjectsOfTypeAll<AircraftDefinition>().ToList();
             if (AllowAllEverywhere.Value) return aircraftList.ToArray();
 
-            List<AircraftDefinition> allowed = new List<AircraftDefinition>();
+            List<AircraftDefinition> allowed = new List<AircraftDefinition>(aircraftList.Count);
             for (int i = 0; i < aircraftList.Count; i++)
             {
                 var def = aircraftList[i];
@@ -809,6 +894,15 @@ namespace SpawnControl
         static void Hangar_CanSpawnAircraft_Postfix(Hangar __instance, AircraftDefinition definition, ref bool __result)
         {
             if (definition == null || __instance == null) return;
+
+            // If the hangar itself is not available (occupied, spawning, or disabled),
+            // no aircraft of any kind can spawn here!
+            if (!__instance.Available)
+            {
+                __result = false;
+                return;
+            }
+
             __result = IsAircraftAllowed(__instance, definition);
         }
 
@@ -817,7 +911,28 @@ namespace SpawnControl
         static void Hangar_GetAvailableAircraft_Postfix(Hangar __instance, ref AircraftDefinition[] __result)
         {
             if (__instance == null) return;
-            __result = GetAllowedAircraftForHangar(__instance);
+
+            // If the hangar itself is not available (occupied, spawning, or disabled),
+            // no aircraft of any kind can spawn here!
+            if (!__instance.Available)
+            {
+                __result = new AircraftDefinition[0];
+                return;
+            }
+
+            // Filter vanilla result (which has occupancy applied) through our config.
+            // Then union with any modded aircraft our config permits that vanilla omits.
+            var filtered = FilterAllowedAircraft(__instance, __result);
+            var fullList = GetAllAllowedAircraftForHangar(__instance);
+            // Add modded aircraft not in vanilla result, but only if they are permitted
+            var resultSet = new HashSet<AircraftDefinition>(filtered);
+            for (int i = 0; i < fullList.Length; i++)
+            {
+                var ac = fullList[i];
+                if (!resultSet.Contains(ac))
+                    resultSet.Add(ac);
+            }
+            __result = System.Linq.Enumerable.ToArray(resultSet);
         }
 
         [HarmonyPatch(typeof(Airbase), nameof(Airbase.CanSpawnAircraft))]
@@ -826,14 +941,30 @@ namespace SpawnControl
         {
             if (__instance == null || definition == null) return;
 
+            // If the airbase itself is disabled, no aircraft can spawn!
+            if (__instance.disabled)
+            {
+                __result = false;
+                return;
+            }
+
             List<Hangar> baseHangars = AirbaseHangarsRef(__instance);
-            if (baseHangars == null || baseHangars.Count == 0) return;
+            if (baseHangars == null || baseHangars.Count == 0)
+            {
+                __result = false;
+                return;
+            }
 
             bool allowed = false;
             for (int i = 0; i < baseHangars.Count; i++)
             {
                 var hangar = baseHangars[i];
-                if (hangar != null && IsAircraftAllowed(hangar, definition))
+                if (hangar == null) continue;
+
+                // Hangar must be available (not occupied, spawning, or disabled)
+                if (!hangar.Available) continue;
+
+                if (IsAircraftAllowed(hangar, definition))
                 {
                     allowed = true;
                     break;
@@ -851,16 +982,32 @@ namespace SpawnControl
             List<Hangar> baseHangars = AirbaseHangarsRef(__instance);
             if (baseHangars == null || baseHangars.Count == 0) return;
 
+            // Filter the vanilla result through our config (preserves occupancy).
+            // Then union with modded aircraft our config permits that vanilla omits.
             var allowedSet = new HashSet<AircraftDefinition>();
+            for (int i = 0; i < __result.Count; i++)
+            {
+                var ac = __result[i];
+                if (ac == null) continue;
+                for (int j = 0; j < baseHangars.Count; j++)
+                {
+                    var hangar = baseHangars[j];
+                    if (hangar != null && hangar.Available && IsAircraftAllowed(hangar, ac))
+                    {
+                        allowedSet.Add(ac);
+                        break;
+                    }
+                }
+            }
+            // Add modded aircraft not in vanilla result, permitted by our config
             for (int i = 0; i < baseHangars.Count; i++)
             {
                 var hangar = baseHangars[i];
-                if (hangar == null) continue;
-                var allowed = GetAllowedAircraftForHangar(hangar);
-                for (int j = 0; j < allowed.Length; j++)
+                if (hangar == null || !hangar.Available) continue; // CRITICAL check for occupancy/availability!
+                var modded = GetAllAllowedAircraftForHangar(hangar);
+                for (int j = 0; j < modded.Length; j++)
                 {
-                    var ac = allowed[j];
-                    allowedSet.Add(ac);
+                    allowedSet.Add(modded[j]);
                 }
             }
             __result = allowedSet.ToList();
