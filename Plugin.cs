@@ -11,7 +11,7 @@ using NuclearOption.Networking;
 
 namespace SpawnControl
 {
-    [BepInPlugin("com.spawncontrol", "SpawnControl", "1.0.0")]
+    [BepInPlugin("com.spawncontrol", "SpawnControl", "1.1")]
     public class SpawnControlPlugin : BaseUnityPlugin
     {
         public static SpawnControlPlugin Instance;
@@ -57,11 +57,10 @@ namespace SpawnControl
         public static Dictionary<string, Dictionary<string, Dictionary<string, ConfigEntry<bool>>>> UnitHangarConfigs = 
             new Dictionary<string, Dictionary<string, Dictionary<string, ConfigEntry<bool>>>>();
 
-        // Key 1: Unit Name
-        // Key 2: Hangar Relative Path
+        // Key: Aircraft Key (unitName)
         // Value: ConfigEntry<int> (0=Both, 1=PALA Only, 2=BDF Only)
-        public static Dictionary<string, Dictionary<string, ConfigEntry<int>>> UnitHangarFactionRestrictions = 
-            new Dictionary<string, Dictionary<string, ConfigEntry<int>>>();
+        public static Dictionary<string, ConfigEntry<int>> AircraftFactionRestrictions = 
+            new Dictionary<string, ConfigEntry<int>>(StringComparer.OrdinalIgnoreCase);
 
         // Optimized compiled field accessors for high-performance zero-allocation hot paths
         private static readonly AccessTools.FieldRef<Hangar, AircraftDefinition[]> HangarAvailableAircraftRef =
@@ -353,6 +352,27 @@ namespace SpawnControl
                 acIndex++;
             }
 
+            // 4. FACTION RESTRICTIONS BINDING: One slider per unique Aircraft
+            for (int i = 0; i < sortedAircraft.Count; i++)
+            {
+                var ac = sortedAircraft[i];
+                string acKey = ac.unitName;
+                if (string.IsNullOrEmpty(acKey)) acKey = ac.name;
+
+                var factionEntry = Instance.Config.Bind(
+                    "3. Faction Restrictions",
+                    $"{acKey} Faction Restriction",
+                    0,
+                    new ConfigDescription(
+                        $"Faction restriction for {acKey}. 0 = Both, 1 = PALA Only, 2 = BDF Only",
+                        new AcceptableValueRange<int>(0, 2)
+                    )
+                );
+
+                AircraftFactionRestrictions[acKey] = factionEntry;
+            }
+
+            SpawnControlPlugin.allAircraft = sortedAircraft;
             Log.LogInfo($"SpawnControl: Configuration pre-generation complete. Bound {sortedAircraft.Count} aircraft against {sortedLocations.Count} locations.");
         }
 
@@ -437,9 +457,9 @@ namespace SpawnControl
             return result;
         }
 
-        
+        // =========================================================================
         // BAKED MODDED AIRCRAFT SPAWNER RULES
-        
+        // =========================================================================
 
         private static readonly HashSet<string> VanillaAircraftKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -546,15 +566,8 @@ namespace SpawnControl
                 return !isShip;
             }
 
-            // 3. Vanilla aircraft rules
-            if (isShip)
-            {
-                // Carriers and naval vessels explicitly specify allowed aircraft natively in their available aircraft lists
-                return nativeAllowed != null && nativeAllowed.Any(nativeAc => nativeAc != null && string.Equals(nativeAc.unitName, acKey, StringComparison.OrdinalIgnoreCase));
-            }
-            
-            // Standard land-based hangars, revetments, and shelters allow conventional aircraft by default
-            return true;
+            // 3. Vanilla aircraft rules: Default to the spawner's native allowed aircraft list
+            return nativeAllowed != null && nativeAllowed.Any(nativeAc => nativeAc != null && string.Equals(nativeAc.unitName, acKey, StringComparison.OrdinalIgnoreCase));
         }
 
         public static string SanitizeConfigKey(string s)
@@ -617,7 +630,7 @@ namespace SpawnControl
             return false;
         }
 
-        public static bool IsAircraftAllowed(Hangar hangar, AircraftDefinition definition, bool vanillaAllowedDefault)
+        public static bool IsAircraftAllowed(Hangar hangar, AircraftDefinition definition)
         {
             if (hangar == null || definition == null) return false;
             if (AllowAllEverywhere.Value) return true;
@@ -625,32 +638,53 @@ namespace SpawnControl
             string acKey = definition.unitName;
             if (string.IsNullOrEmpty(acKey)) acKey = definition.name;
 
+            // Check Faction Restrictions first (global aircraft cheap reject)
+            if (AircraftFactionRestrictions.TryGetValue(acKey, out var factionEntry))
+            {
+                int restriction = factionEntry.Value;
+                if (restriction != 0)
+                {
+                    FactionHQ hq = null;
+                    GameManager.GetLocalHQ(out hq);
+                    if (hq != null && hq.faction != null)
+                    {
+                        string factionName = hq.faction.factionName;
+                        if (factionName != null)
+                        {
+                            if (restriction == 1 && (factionName.IndexOf("boscali", StringComparison.OrdinalIgnoreCase) >= 0 || 
+                                                     factionName.IndexOf("bdf", StringComparison.OrdinalIgnoreCase) >= 0))
+                            {
+                                return false;
+                            }
+                            if (restriction == 2 && (factionName.IndexOf("primeva", StringComparison.OrdinalIgnoreCase) >= 0 || 
+                                                     factionName.IndexOf("pala", StringComparison.OrdinalIgnoreCase) >= 0))
+                            {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+
             bool isShip = false;
             Unit attachedUnit = hangar.attachedUnit ?? hangar.GetComponentInParent<Unit>();
             if (attachedUnit != null)
             {
                 var shipComp = attachedUnit.GetComponent<Ship>() ?? attachedUnit.GetComponentInChildren<Ship>(true);
-                isShip = shipComp != null || attachedUnit.gameObject.name.ToLower().Contains("carrier") || attachedUnit is Ship;
+                if (shipComp != null || attachedUnit is Ship)
+                {
+                    isShip = true;
+                }
+                else
+                {
+                    string attachedName = attachedUnit.name;
+                    isShip = attachedName != null && attachedName.IndexOf("carrier", StringComparison.OrdinalIgnoreCase) >= 0;
+                }
             }
 
             if (ResolveHangarConfigContext(hangar, out string unitName, out Transform configRootTransform))
             {
                 string relativePath = GetRelativePath(hangar.transform, configRootTransform);
-
-                // Check Faction Restrictions first
-                if (UnitHangarFactionRestrictions.TryGetValue(unitName, out var factionDict) &&
-                    factionDict.TryGetValue(relativePath, out var factionEntry))
-                {
-                    int restriction = factionEntry.Value;
-                    FactionHQ hq = null;
-                    GameManager.GetLocalHQ(out hq);
-                    if (hq != null && hq.faction != null)
-                    {
-                        string factionName = hq.faction.factionName.ToLower();
-                        if (restriction == 1 && (factionName.Contains("boscali") || factionName.Contains("bdf"))) return false;
-                        if (restriction == 2 && (factionName.Contains("primeva") || factionName.Contains("pala"))) return false;
-                    }
-                }
 
                 // Process God-Mode Toggles
                 if (isShip && AllowShipsToSpawnAll.Value) return true;
@@ -710,9 +744,7 @@ namespace SpawnControl
 
                         // Resolve variables for dynamic baked defaults
                         string hangarName2 = hangar.name;
-                        string goNameLower2 = hangar.gameObject.name;
-                        bool isHelipad2 = (hangarName2 != null && hangarName2.IndexOf("helipad", StringComparison.OrdinalIgnoreCase) >= 0) ||
-                                          (goNameLower2 != null && goNameLower2.IndexOf("helipad", StringComparison.OrdinalIgnoreCase) >= 0);
+                        bool isHelipad2 = hangarName2 != null && hangarName2.IndexOf("helipad", StringComparison.OrdinalIgnoreCase) >= 0;
 
                         AircraftDefinition[] nativeAllowed = HangarAvailableAircraftRef(hangar);
                         bool defaultAllowed = GetBakedDefaultAllowed(acKey, unitName, displayName, isShip, isHelipad2, definition, nativeAllowed);
@@ -734,46 +766,58 @@ namespace SpawnControl
 
             // 2. Global VTOL Settings
             string hangarName = hangar.name;
-            string goNameLower = hangar.gameObject.name;
-            bool isHelipad = (hangarName != null && hangarName.IndexOf("helipad", StringComparison.OrdinalIgnoreCase) >= 0) ||
-                             (goNameLower != null && goNameLower.IndexOf("helipad", StringComparison.OrdinalIgnoreCase) >= 0);
+            bool isHelipad = hangarName != null && hangarName.IndexOf("helipad", StringComparison.OrdinalIgnoreCase) >= 0;
 
             if (isHelipad && AllowAllVTOLsOnHelipads.Value && IsVTOL(definition))
             {
                 return true;
             }
 
-            return vanillaAllowedDefault;
+            // 3. Absolute Final Fallback: Vanilla Game Rules
+            AircraftDefinition[] origList = HangarAvailableAircraftRef(hangar);
+            if (origList != null)
+            {
+                return origList.Any(nativeAc => nativeAc != null && string.Equals(nativeAc.unitName, acKey, StringComparison.OrdinalIgnoreCase));
+            }
+
+            return false;
         }
 
-        
+        public static AircraftDefinition[] GetAllowedAircraftForHangar(Hangar hangar)
+        {
+            if (hangar == null) return new AircraftDefinition[0];
+            
+            var aircraftList = allAircraft.Count > 0 ? allAircraft : Resources.FindObjectsOfTypeAll<AircraftDefinition>().ToList();
+            if (AllowAllEverywhere.Value) return aircraftList.ToArray();
+
+            List<AircraftDefinition> allowed = new List<AircraftDefinition>();
+            for (int i = 0; i < aircraftList.Count; i++)
+            {
+                var def = aircraftList[i];
+                if (def == null || string.IsNullOrEmpty(def.unitName)) continue;
+                if (IsAircraftAllowed(hangar, def)) allowed.Add(def);
+            }
+            return allowed.ToArray();
+        }
+
+        // =========================================================================
         // ACTIVE HARMONY OVERRIDE PATCHES
-        
+        // =========================================================================
 
         [HarmonyPatch(typeof(Hangar), nameof(Hangar.CanSpawnAircraft))]
         [HarmonyPostfix]
         static void Hangar_CanSpawnAircraft_Postfix(Hangar __instance, AircraftDefinition definition, ref bool __result)
         {
             if (definition == null || __instance == null) return;
-            __result = IsAircraftAllowed(__instance, definition, __result);
+            __result = IsAircraftAllowed(__instance, definition);
         }
 
         [HarmonyPatch(typeof(Hangar), nameof(Hangar.GetAvailableAircraft))]
         [HarmonyPostfix]
         static void Hangar_GetAvailableAircraft_Postfix(Hangar __instance, ref AircraftDefinition[] __result)
         {
-            if (__instance == null || __result == null) return;
-
-            List<AircraftDefinition> filtered = new List<AircraftDefinition>();
-            foreach (var ac in __result)
-            {
-                if (ac == null) continue;
-                if (IsAircraftAllowed(__instance, ac, true)) 
-                {
-                    filtered.Add(ac);
-                }
-            }
-            __result = filtered.ToArray();
+            if (__instance == null) return;
+            __result = GetAllowedAircraftForHangar(__instance);
         }
 
         [HarmonyPatch(typeof(Airbase), nameof(Airbase.CanSpawnAircraft))]
@@ -786,9 +830,10 @@ namespace SpawnControl
             if (baseHangars == null || baseHangars.Count == 0) return;
 
             bool allowed = false;
-            foreach (var hangar in baseHangars)
+            for (int i = 0; i < baseHangars.Count; i++)
             {
-                if (hangar != null && IsAircraftAllowed(hangar, definition, true))
+                var hangar = baseHangars[i];
+                if (hangar != null && IsAircraftAllowed(hangar, definition))
                 {
                     allowed = true;
                     break;
@@ -807,17 +852,15 @@ namespace SpawnControl
             if (baseHangars == null || baseHangars.Count == 0) return;
 
             var allowedSet = new HashSet<AircraftDefinition>();
-            foreach (var ac in __result)
+            for (int i = 0; i < baseHangars.Count; i++)
             {
-                if (ac == null) continue;
-                
-                foreach (var hangar in baseHangars)
+                var hangar = baseHangars[i];
+                if (hangar == null) continue;
+                var allowed = GetAllowedAircraftForHangar(hangar);
+                for (int j = 0; j < allowed.Length; j++)
                 {
-                    if (hangar != null && IsAircraftAllowed(hangar, ac, true))
-                    {
-                        allowedSet.Add(ac);
-                        break;
-                    }
+                    var ac = allowed[j];
+                    allowedSet.Add(ac);
                 }
             }
             __result = allowedSet.ToList();
