@@ -11,17 +11,47 @@ using NuclearOption.Networking;
 
 namespace SpawnControl
 {
-    [BepInPlugin("com.spawncontrol", "SpawnControl", "1.1")]
+    [BepInPlugin("com.spawncontrol", "SpawnControl", "1.2")]
     public class SpawnControlPlugin : BaseUnityPlugin
     {
         public static SpawnControlPlugin Instance;
         public static ManualLogSource Log;
 
         // Global Configuration Overrides
+        public static ConfigEntry<bool> ResetAllSettings;
+        public static ConfigEntry<bool> DebugAuditorMode;
         public static ConfigEntry<bool> AllowAllEverywhere;
         public static ConfigEntry<bool> AllowShipsToSpawnAll;
         public static ConfigEntry<bool> AllowLandBasesToSpawnAll;
         public static ConfigEntry<bool> AllowAllVTOLsOnHelipads;
+
+        // Mappings from prefab.txt
+        public static readonly Dictionary<string, string> PrefabToDisplayName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "AttackHelo1", "SAH-46 Chicane" },
+            { "SmallFighter1", "FS-20 Vortex" },
+            { "FastBomber1", "Alkyon AB-4" },
+            { "UFO", "???" },
+            { "COIN", "CI-22 Cricket" },
+            { "EW1", "EW-25 Medusa" },
+            { "QuadVTOL1", "VL-49 Tarantula" },
+            { "SFB", "SFB-81 Darkreach" },
+            { "Trainer", "T/A-30 Compass" },
+            { "UtilityHelo1", "UH-90 Ibis" },
+            { "CAS1", "A-19 Brawler" },
+            { "Fighter1", "FS-12 Revoker" },
+            { "Multirole1", "KR-67 Ifrit" },
+            { "Aryx_LightHelicopter1_Definition", "RAH-72 Knockout" },
+            { "Aryx_MiG-15_AircraftDefinition", "MiG-15" },
+            { "P_Trisurface1_definition", "FS-3 Ternion" },
+            { "Aryx_F16M_KingViper_AircraftDefinition", "F-16M King Viper" },
+            { "Aryx_MC260_Chimera_Definition", "MC-260 Chimera" },
+            { "kestrel_definition", "FQ-106 Kestrel" }
+        };
+
+        // Startup scanned cache of natively allowed aircraft per hangar
+        public static Dictionary<string, Dictionary<string, HashSet<string>>> NativeAllowedCache = 
+            new Dictionary<string, Dictionary<string, HashSet<string>>>(StringComparer.OrdinalIgnoreCase);
 
         // Metadata structures for granular configs
         public class ShipHangarInfo
@@ -36,11 +66,8 @@ namespace SpawnControl
             public string UnitName;
             public string RelativePath;
             public string DisplayName;
-            public AircraftDefinition[] NativeAllowed;
-            public AircraftDefinition[] AirbaseAllowed;
             public int UnitSortOrder;
             public int HangarIndex;
-            public bool IsHelipad;
         }
 
         // Maps internal prefab names (e.g. "helipad1") to the primary dictionary key ("Helipad")
@@ -53,11 +80,11 @@ namespace SpawnControl
         // Unified Config Dictionaries:
         // Key 1: Unit Name (e.g. "Large Hangar", "Fleet Carrier")
         // Key 2: Hangar Relative Path (hierarchy tree from ship/building root)
-        // Key 3: Aircraft Definition UnitName (e.g. "CI-22 Cricket")
+        // Key 3: Aircraft Prefab Name (e.g. "COIN")
         public static Dictionary<string, Dictionary<string, Dictionary<string, ConfigEntry<bool>>>> UnitHangarConfigs = 
             new Dictionary<string, Dictionary<string, Dictionary<string, ConfigEntry<bool>>>>();
 
-        // Key: Aircraft Key (unitName)
+        // Key: Aircraft Key (prefab name)
         // Value: ConfigEntry<int> (0=Both, 1=PALA Only, 2=BDF Only)
         public static Dictionary<string, ConfigEntry<int>> AircraftFactionRestrictions = 
             new Dictionary<string, ConfigEntry<int>>(StringComparer.OrdinalIgnoreCase);
@@ -72,9 +99,7 @@ namespace SpawnControl
         private static readonly AccessTools.FieldRef<Airbase, List<AircraftDefinition>> AirbaseAvailableAircraftRef =
             AccessTools.FieldRefAccess<Airbase, List<AircraftDefinition>>("availableAircraft");
 
-        // We now use the game's native, high-performance hangar.Available check.
-
-        // Caches VTOL reflection checks by Aircraft unitName for maximum performance
+        // Caches VTOL reflection checks by Aircraft prefab name for maximum performance
         public static Dictionary<string, bool> VTOLCache = new Dictionary<string, bool>();
 
         public static HashSet<Hangar> CachedHangars = new HashSet<Hangar>();
@@ -87,6 +112,20 @@ namespace SpawnControl
             Log.LogInfo("Spawn Control Mod initializing...");
 
             // Bind Global Controls with Explicit Order
+            ResetAllSettings = Config.Bind("0. Global Overrides", "Reset All to Default", false,
+                new ConfigDescription("Clicking this button resets all configuration options below to their default values.", null,
+                new ConfigurationManagerAttributes 
+                { 
+                    Order = 10, 
+                    CustomDrawer = DrawResetButton,
+                    HideSettingName = true,
+                    HideDefaultButton = true
+                }));
+
+            DebugAuditorMode = Config.Bind("0. Global Overrides", "Debug Auditor Mode Only", false, 
+                new ConfigDescription("If enabled, restricts spawning strictly to vanilla/baked predesignated locations.", null, 
+                new ConfigurationManagerAttributes { Order = 5 }));
+
             AllowAllEverywhere = Config.Bind("0. Global Overrides", "Allow All Aircraft Everywhere", false, 
                 new ConfigDescription("If enabled, completely bypasses all restrictions.", null, 
                 new ConfigurationManagerAttributes { Order = 4 }));
@@ -118,13 +157,72 @@ namespace SpawnControl
             StartCoroutine(InitSpawnControlConfigs());
         }
 
+        static void DrawResetButton(BepInEx.Configuration.ConfigEntryBase entry)
+        {
+            if (GUILayout.Button("Reset All to Default", GUILayout.ExpandWidth(true)))
+            {
+                ResetAllToDefaults();
+            }
+        }
+
+        public static void ResetAllToDefaults()
+        {
+            Log.LogInfo("Resetting all configurations to defaults...");
+
+            // 1. Reset Global Overrides
+            if (DebugAuditorMode != null) DebugAuditorMode.Value = (bool)DebugAuditorMode.DefaultValue;
+            if (AllowAllEverywhere != null) AllowAllEverywhere.Value = (bool)AllowAllEverywhere.DefaultValue;
+            if (AllowShipsToSpawnAll != null) AllowShipsToSpawnAll.Value = (bool)AllowShipsToSpawnAll.DefaultValue;
+            if (AllowLandBasesToSpawnAll != null) AllowLandBasesToSpawnAll.Value = (bool)AllowLandBasesToSpawnAll.DefaultValue;
+            if (AllowAllVTOLsOnHelipads != null) AllowAllVTOLsOnHelipads.Value = (bool)AllowAllVTOLsOnHelipads.DefaultValue;
+
+            // 2. Reset Aircraft Hangar Configurations
+            if (UnitHangarConfigs != null)
+            {
+                foreach (var unitKvp in UnitHangarConfigs.Values)
+                {
+                    if (unitKvp == null) continue;
+                    foreach (var pathKvp in unitKvp.Values)
+                    {
+                        if (pathKvp == null) continue;
+                        foreach (var configKvp in pathKvp.Values)
+                        {
+                            if (configKvp != null)
+                            {
+                                configKvp.Value = (bool)configKvp.DefaultValue;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. Reset Faction Restrictions
+            if (AircraftFactionRestrictions != null)
+            {
+                foreach (var factionEntry in AircraftFactionRestrictions.Values)
+                {
+                    if (factionEntry != null)
+                    {
+                        factionEntry.Value = (int)factionEntry.DefaultValue;
+                    }
+                }
+            }
+
+            // 4. Save the config file
+            if (Instance != null && Instance.Config != null)
+            {
+                Instance.Config.Save();
+            }
+            Log.LogInfo("All configuration settings have been reset to defaults.");
+        }
+
         private IEnumerator InitSpawnControlConfigs()
         {
             Log.LogInfo("SpawnControl: Waiting for Blueprinter assets to load and stabilize...");
 
             // 1. Wait until both AircraftDefinition and UnitDefinition counts stabilize (non-zero and unchanging) with hard timeout
             UnitDefinition[] allUnits = null;
-            AircraftDefinition[] allAircraft = null;
+            AircraftDefinition[] allAircraftList = null;
 
             int stableCount = 0;
             int lastUnitsCount = 0;
@@ -134,10 +232,10 @@ namespace SpawnControl
             while (waitSeconds < 15) // 15 seconds safety timeout to prevent infinite hang at startup
             {
                 allUnits = Resources.FindObjectsOfTypeAll<UnitDefinition>();
-                allAircraft = Resources.FindObjectsOfTypeAll<AircraftDefinition>();
+                allAircraftList = Resources.FindObjectsOfTypeAll<AircraftDefinition>();
 
                 int uCount = allUnits != null ? allUnits.Length : 0;
-                int aCount = allAircraft != null ? allAircraft.Length : 0;
+                int aCount = allAircraftList != null ? allAircraftList.Length : 0;
 
                 if (uCount > 0 && aCount > 0)
                 {
@@ -168,32 +266,91 @@ namespace SpawnControl
             Log.LogInfo($"SpawnControl: Stable at {lastAircraftCount} aircraft and {lastUnitsCount} units. Pre-generating hangar options...");
 
             allUnits = Resources.FindObjectsOfTypeAll<UnitDefinition>();
-            allAircraft = Resources.FindObjectsOfTypeAll<AircraftDefinition>();
+            allAircraftList = Resources.FindObjectsOfTypeAll<AircraftDefinition>();
 
-            // 1. GATHER AND SORT ALL AIRCRAFT (These will become the Main Categories)
-            var sortedAircraft = allAircraft
-                .Where(a => a != null && !string.IsNullOrEmpty(a.unitName))
-                .GroupBy(a => a.unitName).Select(g => g.First()) 
-                .OrderBy(a => a.unitName.Contains("???") ? 1 : 0) // Push UFO to bottom visually
-                .ThenBy(a => a.unitName) 
-                .ToList();
-
-            // 2. GATHER ALL HANGARS/LOCATIONS (These will become the Sublist Toggles)
+            // 1. POPULATE GLOBAL NATIVE ALLOWED CACHE DIRECTLY FROM PREFABS
             var validUnits = allUnits
                 .Where(def => def != null && def.unitPrefab != null && !string.IsNullOrEmpty(def.unitName))
                 .Where(def => def.unitPrefab.GetComponentsInChildren<Hangar>(true).Length > 0)
                 .ToList();
 
+            var nativeListField = typeof(Hangar).GetField("availableAircraft", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+            foreach (var def in validUnits)
+            {
+                string unitName = GetUnitDisplayName(string.IsNullOrEmpty(def.unitName) ? def.name : def.unitName);
+
+                var baseHangars = def.unitPrefab.GetComponentsInChildren<Hangar>(true).ToList();
+                if (baseHangars.Count == 0) continue;
+
+                if (!NativeAllowedCache.ContainsKey(unitName))
+                    NativeAllowedCache[unitName] = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+
+                for (int i = 0; i < baseHangars.Count; i++)
+                {
+                    var hangar = baseHangars[i];
+                    if (hangar == null) continue;
+
+                    string relativePath = GetRelativePath(hangar.transform, def.unitPrefab.transform);
+                    
+                    AircraftDefinition[] nativeAllowed = null;
+                    if (nativeListField != null)
+                    {
+                        nativeAllowed = nativeListField.GetValue(hangar) as AircraftDefinition[];
+                    }
+
+                    var allowedSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    if (nativeAllowed != null)
+                    {
+                        foreach (var ac in nativeAllowed)
+                        {
+                            if (ac != null && !string.IsNullOrEmpty(ac.name))
+                            {
+                                allowedSet.Add(ac.name);
+                            }
+                        }
+                    }
+
+                    NativeAllowedCache[unitName][relativePath] = allowedSet;
+                }
+            }
+
+            // 2. GATHER AND SORT ALL AIRCRAFT (These will become the Main Categories)
+            // Rely entirely on prefab name (ac.name)
+            var sortedAircraft = allAircraftList
+                .Where(a => a != null && !string.IsNullOrEmpty(a.name))
+                .GroupBy(a => a.name).Select(g => g.First()) 
+                .OrderBy(a => a.name.Contains("UFO") || a.name.Contains("???") ? 1 : 0) // Push UFO to bottom visually
+                .ThenBy(a => a.name) 
+                .ToList();
+
             // Sort Ships dynamically by Mass (descending) to logically group Heavy Carriers > Destroyers > Patrol Ships
             var ships = validUnits
-                .Where(def => def is ShipDefinition || def.unitPrefab.GetComponentInChildren<Ship>(true) != null)
+                .Where(def => def is ShipDefinition || 
+                              def.unitPrefab.GetComponentInChildren<Ship>(true) != null ||
+                              def.unitName.ToLower().Contains("carrier") || 
+                              def.unitName.ToLower().Contains("destroyer") || 
+                              def.unitName.ToLower().Contains("frigate") || 
+                              def.unitName.ToLower().Contains("corvette") || 
+                              def.unitName.ToLower().Contains("cutter") || 
+                              def.unitName.ToLower().Contains("cruiser") || 
+                              def.unitName.ToLower().Contains("supply ship") ||
+                              def.unitName.ToLower().Contains("supplyship") ||
+                              def.name.ToLower().Contains("carrier") || 
+                              def.name.ToLower().Contains("destroyer") || 
+                              def.name.ToLower().Contains("frigate") || 
+                              def.name.ToLower().Contains("corvette") || 
+                              def.name.ToLower().Contains("cutter") || 
+                              def.name.ToLower().Contains("cruiser") || 
+                              def.name.ToLower().Contains("supply ship") ||
+                              def.name.ToLower().Contains("supplyship"))
                 .OrderByDescending(def => def.mass)
                 .ThenBy(def => def.unitName)
                 .ToList();
 
             // Sort Ground structures alphabetically
             var grounds = validUnits
-                .Where(def => !(def is ShipDefinition) && def.unitPrefab.GetComponentInChildren<Ship>(true) == null)
+                .Where(def => !ships.Contains(def))
                 .OrderBy(def => def.unitName)
                 .ToList();
 
@@ -205,8 +362,7 @@ namespace SpawnControl
                 for (int uIndex = 0; uIndex < unitList.Count; uIndex++)
                 {
                     var def = unitList[uIndex];
-                    string unitName = def.unitName;
-                    if (string.IsNullOrEmpty(unitName)) unitName = def.name;
+                    string unitName = GetUnitDisplayName(string.IsNullOrEmpty(def.unitName) ? def.name : def.unitName);
 
                     // Register robust aliases for runtime mapping to handle map-placed clones perfectly
                     if (!string.IsNullOrEmpty(def.name)) UnitNameAliases[def.name] = unitName;
@@ -219,10 +375,7 @@ namespace SpawnControl
                     if (!string.IsNullOrEmpty(sanitizedUnitName)) UnitNameAliases[sanitizedUnitName] = unitName;
 
                     var airbase = def.unitPrefab.GetComponentInChildren<Airbase>(true);
-                    List<Hangar> baseHangars = null;
-                    
-                    // Direct component gather from prefab to prevent state re-initialization corruption
-                    baseHangars = def.unitPrefab.GetComponentsInChildren<Hangar>(true).ToList();
+                    List<Hangar> baseHangars = def.unitPrefab.GetComponentsInChildren<Hangar>(true).ToList();
 
                     if (baseHangars.Count == 0) continue; // Final safety net
 
@@ -231,7 +384,6 @@ namespace SpawnControl
 
                     var elevatorField = typeof(Hangar).GetField("elevator", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
                     var doorsField = typeof(Hangar).GetField("doors", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                    var nativeListField = typeof(Hangar).GetField("availableAircraft", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
 
                     int elevatorCount = 0;
                     int helipadCount = 0;
@@ -251,6 +403,16 @@ namespace SpawnControl
                         string goName = hangar.gameObject.name.ToLower();
                         bool isHelipad = name.Contains("helipad") || goName.Contains("helipad");
 
+                        string relativePath = GetRelativePath(hangar.transform, def.unitPrefab.transform);
+
+                        // Look up friendly naval spawn description
+                        string friendlyDesc = null;
+                        if (NavalFriendlyDescriptions.TryGetValue(unitName, out var pathMap) &&
+                            pathMap.TryGetValue(relativePath, out string desc))
+                        {
+                            friendlyDesc = desc;
+                        }
+
                         string hangarType = "";
                         string configName = "";
 
@@ -258,13 +420,13 @@ namespace SpawnControl
                         {
                             elevatorCount++;
                             hangarType = "elevator";
-                            configName = $"elevator_{elevatorCount}";
+                            configName = friendlyDesc ?? $"elevator_{elevatorCount}";
                         }
                         else if (isHelipad)
                         {
                             helipadCount++;
                             hangarType = "helipad";
-                            configName = $"helipad_{helipadCount}";
+                            configName = friendlyDesc ?? $"helipad_{helipadCount}";
                         }
                         else
                         {
@@ -274,48 +436,24 @@ namespace SpawnControl
                             {
                                 deckspawnCount++;
                                 hangarType = "deckspawn";
-                                configName = $"deckspawn_{deckspawnCount}";
+                                configName = friendlyDesc ?? $"deckspawn_{deckspawnCount}";
                             }
                             else
                             {
                                 hangarCount++;
                                 hangarType = "hangar";
-                                configName = $"hangar_{hangarCount}";
+                                configName = friendlyDesc ?? $"hangar_{hangarCount}";
                             }
                         }
 
-                        string relativePath = GetRelativePath(hangar.transform, def.unitPrefab.transform);
                         var info = new ShipHangarInfo { HangarType = hangarType, ConfigName = configName };
                         HangarMetadataByPath[unitName][relativePath] = info;
-
-                        AircraftDefinition[] nativeAllowed = null;
-                        if (nativeListField != null)
-                        {
-                            nativeAllowed = nativeListField.GetValue(hangar) as AircraftDefinition[];
-                        }
-
-                        // Query and evaluate natively allowed defaults with parent airbase check
-                        AircraftDefinition[] airbaseAllowed = null;
-                        if (airbase != null)
-                        {
-                            var airbaseListField = typeof(Airbase).GetField("availableAircraft", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                            if (airbaseListField != null)
-                            {
-                                var list = airbaseListField.GetValue(airbase) as List<AircraftDefinition>;
-                                if (list != null)
-                                {
-                                    airbaseAllowed = list.ToArray();
-                                }
-                            }
-                        }
 
                         // Log this location to be flat-mapped against every aircraft later
                         allLocations.Add(new GlobalHangarInfo {
                             UnitName = unitName,
                             RelativePath = relativePath,
                             DisplayName = $"{categoryPrefix}{unitName} - {i + 1:D2}. {configName}",
-                            NativeAllowed = nativeAllowed,
-                            AirbaseAllowed = airbaseAllowed,
                             UnitSortOrder = unitSortOrder,
                             HangarIndex = i
                         });
@@ -334,10 +472,12 @@ namespace SpawnControl
             int acIndex = 1;
             foreach (var ac in sortedAircraft)
             {
-                string acKey = ac.unitName;
+                string acKey = ac.name; // Rely entirely on prefab name!
+                string friendlyName = PrefabToDisplayName.TryGetValue(acKey, out string fn) ? fn : ac.unitName;
+                if (string.IsNullOrEmpty(friendlyName)) friendlyName = acKey;
                 
                 // Prefix with 1. Aircraft or 9. UFO to force them below 0. Global Overrides
-                string sectionName = acKey.Contains("???") ? $"9. UFO - {acKey}" : $"1. Aircraft - {acIndex:D2}. {acKey}";
+                string sectionName = acKey.Contains("UFO") || acKey.Contains("???") ? $"9. UFO - {acKey}" : $"1. Aircraft - {acIndex:D2}. {friendlyName} ({acKey})";
 
                 int locationOrderCounter = sortedLocations.Count; // High number = renders at the top of the category
 
@@ -346,13 +486,17 @@ namespace SpawnControl
                     bool isShip = location.UnitName.ToLower().Contains("carrier") || 
                                   location.UnitName.ToLower().Contains("destroyer") || 
                                   location.UnitName.ToLower().Contains("frigate") || 
+                                  location.UnitName.ToLower().Contains("corvette") || 
                                   location.UnitName.ToLower().Contains("cutter") || 
                                   location.UnitName.ToLower().Contains("cruiser") || 
-                                  location.UnitName.ToLower().Contains("supply ship");
+                                  location.UnitName.ToLower().Contains("supply ship") ||
+                                  location.UnitName.ToLower().Contains("supplyship") ||
+                                  location.UnitName.ToLower().Contains("landing craft") ||
+                                  location.UnitName.ToLower().Contains("otb-31");
 
                     bool isHelipad = location.DisplayName.ToLower().Contains("helipad");
 
-                    bool defaultAllowed = GetBakedDefaultAllowed(acKey, location.UnitName, location.DisplayName, isShip, isHelipad, ac, location.NativeAllowed);
+                    bool defaultAllowed = IsPredesignatedPlace(acKey, location.UnitName, location.RelativePath, isShip, isHelipad, ac);
 
                     string keyName = SanitizeConfigKey(location.DisplayName);
 
@@ -360,7 +504,7 @@ namespace SpawnControl
                         sectionName, 
                         keyName, 
                         defaultAllowed, 
-                        new ConfigDescription($"Allow {acKey} to spawn at {location.DisplayName}.", null, 
+                        new ConfigDescription($"Allow {friendlyName} ({acKey}) to spawn at {location.DisplayName}.", null, 
                         new ConfigurationManagerAttributes { DispName = keyName, Order = locationOrderCounter })
                     );
 
@@ -382,15 +526,16 @@ namespace SpawnControl
             for (int i = 0; i < sortedAircraft.Count; i++)
             {
                 var ac = sortedAircraft[i];
-                string acKey = ac.unitName;
-                if (string.IsNullOrEmpty(acKey)) acKey = ac.name;
+                string acKey = ac.name; // Rely entirely on prefab name!
+                string friendlyName = PrefabToDisplayName.TryGetValue(acKey, out string fn) ? fn : ac.unitName;
+                if (string.IsNullOrEmpty(friendlyName)) friendlyName = acKey;
 
                 var factionEntry = Instance.Config.Bind(
                     "3. Faction Restrictions",
-                    $"{acKey} Faction Restriction",
+                    $"{friendlyName} ({acKey}) Faction Restriction",
                     0,
                     new ConfigDescription(
-                        $"Faction restriction for {acKey}. 0 = Both, 1 = PALA Only, 2 = BDF Only",
+                        $"Faction restriction for {friendlyName} ({acKey}). 0 = Both, 1 = PALA Only, 2 = BDF Only",
                         new AcceptableValueRange<int>(0, 2)
                     )
                 );
@@ -429,8 +574,8 @@ namespace SpawnControl
         private static bool IsVTOL(AircraftDefinition def)
         {
             if (def == null) return false;
-            string acKey = def.unitName;
-            if (string.IsNullOrEmpty(acKey)) acKey = def.name;
+            string acKey = def.name; // Rely entirely on prefab name!
+            if (string.IsNullOrEmpty(acKey)) acKey = def.unitName;
 
             if (VTOLCache.TryGetValue(acKey, out bool isVtol))
                 return isVtol;
@@ -471,8 +616,8 @@ namespace SpawnControl
             if (!result)
             {
                 string lower = def.name.ToLower();
-                string unitNameLower = acKey.ToLower();
-                if (lower.Contains("chicane") || lower.Contains("ibis") || lower.Contains("tarantula") || lower.Contains("medusa") || lower.Contains("vortex") ||
+                string unitNameLower = (def.unitName ?? "").ToLower();
+                if (lower.Contains("chicane") || lower.Contains("ibis") || lower.Contains("tarantula") || lower.Contains("medusa") || lower.Contains("vortex") || lower.Contains("lighthelicopter") ||
                     unitNameLower.Contains("chicane") || unitNameLower.Contains("ibis") || unitNameLower.Contains("tarantula") || unitNameLower.Contains("medusa") || unitNameLower.Contains("vortex"))
                 {
                     result = true;
@@ -487,26 +632,6 @@ namespace SpawnControl
         // BAKED MODDED AIRCRAFT SPAWNER RULES
         // =========================================================================
 
-        // Matched against AircraftDefinition.unitName (display name — can be changed by other mods)
-        private static readonly HashSet<string> VanillaAircraftKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            "CI-22 Cricket",      // COIN
-            "SAH-46 Chicane",     // AttackHelo1
-            "A-19 Brawler",       // CAS1
-            "Alkyon AB-4",        // FastBomber1
-            "T/A-30 Compass",     // Trainer
-            "FS-12 Revoker",      // Fighter1
-            "EW-25 Medusa",       // EW1
-            "UH-90 Ibis",         // UtilityHelo1
-            "FS-20 Vortex",       // SmallFighter1
-            "KR-67 Ifrit",        // Mulltirolle1
-            "VL-49 Tarantula",    // QuadVTOL1
-            "SFB-81 Darkreach",   // Darkreach
-        };
-
-        // Matched against AircraftDefinition.name (prefab asset name — stable, never changed by mods)
-        // This is the fallback so vanilla aircraft are correctly identified even if another mod
-        // renames their unitName display string.
         private static readonly HashSet<string> VanillaPrefabNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "COIN",
@@ -518,26 +643,116 @@ namespace SpawnControl
             "EW1",
             "UtilityHelo1",
             "SmallFighter1",
-            "Mulltirolle1",
+            "Multirole1",
             "QuadVTOL1",
             "Darkreach",
+            "SFB",
         };
 
-        // Returns true if this AircraftDefinition is a vanilla aircraft, regardless
-        // of whether another mod has renamed its display unitName.
         public static bool IsVanillaAircraft(AircraftDefinition ac)
         {
             if (ac == null) return false;
-            if (!string.IsNullOrEmpty(ac.unitName) && VanillaAircraftKeys.Contains(ac.unitName)) return true;
-            if (!string.IsNullOrEmpty(ac.name)     && VanillaPrefabNames.Contains(ac.name))     return true;
+            if (!string.IsNullOrEmpty(ac.name) && VanillaPrefabNames.Contains(ac.name)) return true;
             return false;
         }
+        public static readonly Dictionary<string, string> ShipPrefabToDisplayName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "Aryx_StrikeCarrier1", "Aryx Strike Carrier" },
+            { "Aryx_SupplyShip1", "Aryx Supply Ship" },
+            { "Aryx_EscortCarrier1", "Aryx Escort Carrier" },
+            { "Aryx_HeavyFrigate1", "Aryx Heavy Frigate" }
+        };
 
-        // 2. Check if this is a known modded aircraft
-        // (kept as separate variable to preserve caller context)
-        private static bool IsModdedAircraft(AircraftDefinition ac, string acKey)
-            => !IsVanillaAircraft(ac) && !VanillaAircraftKeys.Contains(acKey);
+        public static readonly Dictionary<string, Dictionary<string, string>> NavalFriendlyDescriptions = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            {
+                "Annex Class Carrier",
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    { "hangar_M", "Mid Elevator" },
+                    { "hull_RL/hull_RR/hull_wellDeck/hull_RRL/hangar_R1", "Well Deck Elevator" },
+                    { "hull_RL/hull_RR/hull_wellDeck/hangar_RR/hangar_R2", "Well Deck Deckspawn 1" },
+                    { "hull_RL/hull_RR/hull_wellDeck/hangar_RR/hangar_R3", "Well Deck Deckspawn 2" },
+                    { "hull_L/hull_FR/hangar_F", "Bow Elevator" }
+                }
+            },
+            {
+                "Hyperion Class Carrier",
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    { "hull_R/hull_R2/hull_RRRL/hangar_R2", "Aft Deckspawn 1" },
+                    { "hull_R/hull_R2/hull_RRRR/hangar_R3", "Aft Deckspawn 2" },
+                    { "hull_R/hull_RRR/hangar_R1", "Main Hangar" },
+                    { "hull_F/hangar_F", "Bow Hangar" }
+                }
+            },
+            {
+                "Devotion Class Light Carrier",
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    { "Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_BR/Hangar_H", "Heli Elevator" },
+                    { "Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_Rear_R/Hangar_F", "Bow Elevator" },
+                    { "Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_Rear_R/Hangar_R_01", "Rear Hangar 1" },
+                    { "Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_Rear_R/Hangar_R_02", "Rear Hangar 2" }
+                }
+            },
+            {
+                "Andromeda class Cruiser",
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    { "Aryx_StrikeCarrier1_Hull_Rear/Hangar_Main", "Main Hangar" },
+                    { "Aryx_StrikeCarrier1_Hull_Rear/Hangar_Heli", "Heli Hangar" },
+                    { "Hangar_Deck_H1", "Helipad Deck" },
+                    { "Hangar_Deck_F1", "Front Helipad 1" },
+                    { "Hangar_Deck_F2", "Front Helipad 2" }
+                }
+            },
+            {
+                "Atlas Class Supply Ship",
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    { "Aryx_SupplyShip1_Rear/Aryx_SupplyShip1_Stern/Hangar_R", "Stern Hangar" },
+                    { "Aryx_SupplyShip1_Hangar_Floor/Hangar_F", "Main Hangar" }
+                }
+            },
+            {
+                "Ironside Class Frigate",
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    { "Aryx_Frigate2_Hangar/Hangar", "Hangar" }
+                }
+            },
+            {
+                "Argus Class Frigate",
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    { "frigate1_hull_R/frigate1_hangar", "Hangar" }
+                }
+            },
+            {
+                "Cursor Class LFD",
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    { "hangar", "Hangar" }
+                }
+            },
+            {
+                "Dynamo Class Destroyer",
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    { "Hull_CR/Hull_hangarFloor", "Hangar" }
+                }
+            }
+        };
 
+        public static string GetUnitDisplayName(string rawName)
+        {
+            if (string.IsNullOrEmpty(rawName)) return "";
+            string clean = SanitizeGameObjectName(rawName);
+            if (ShipPrefabToDisplayName.TryGetValue(clean, out string friendly)) return friendly;
+            if (ShipPrefabToDisplayName.TryGetValue(rawName, out friendly)) return friendly;
+            return rawName;
+        }
 
         private static readonly HashSet<string> VanillaShipNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -547,7 +762,17 @@ namespace SpawnControl
             "Annex Class Carrier",
             "Dynamo Class Destroyer",
             "Hyperion Class Carrier",
-            "OTB-31 landing craft"
+            "OTB-31 landing craft",
+            // Modded ships (raw names)
+            "Aryx_StrikeCarrier1",
+            "Aryx_SupplyShip1",
+            "Aryx_EscortCarrier1",
+            "Aryx_HeavyFrigate1",
+            // Modded ships (friendly names)
+            "Aryx Strike Carrier",
+            "Aryx Supply Ship",
+            "Aryx Escort Carrier",
+            "Aryx Heavy Frigate"
         };
 
         public static bool IsVanillaShip(string unitName)
@@ -557,9 +782,9 @@ namespace SpawnControl
             return VanillaShipNames.Contains(unitName) || VanillaShipNames.Contains(clean);
         }
 
-        public static bool GetBakedDefaultAllowed(string acKey, string unitName, string displayName, bool isShip, bool isHelipad, AircraftDefinition ac, AircraftDefinition[] nativeAllowed)
+        public static bool GetBakedDefaultAllowed(string acPrefabName, string unitName, string displayName, bool isShip, bool isHelipad, AircraftDefinition ac, AircraftDefinition[] nativeAllowed)
         {
-            string acLower = acKey.ToLower();
+            string acLower = acPrefabName.ToLower();
             string unitLower = unitName.ToLower();
             string displayLower = displayName.ToLower();
 
@@ -569,8 +794,8 @@ namespace SpawnControl
                 return IsVTOL(ac);
             }
 
-            // 2. Check if this is a known modded aircraft (checks both unitName and stable prefab name)
-            bool isModded = IsModdedAircraft(ac, acKey);
+            // 2. Check if this is a known modded aircraft
+            bool isModded = !IsVanillaAircraft(ac);
 
             if (isModded)
             {
@@ -580,7 +805,7 @@ namespace SpawnControl
                     return false;
                 }
                 // A. MiG-15
-                if (acLower.Contains("mig-15"))
+                if (acLower.Contains("mig-15") || acLower.Contains("aryx_mig-15"))
                 {
                     if (unitLower.Contains("revetment")) return true;
                     if (unitLower.Contains("shelter")) return true;
@@ -589,8 +814,8 @@ namespace SpawnControl
                     return false;
                 }
 
-                // B. F-16M King Viper (and any generic F-16)
-                if (acLower.Contains("f-16") || acLower.Contains("king viper"))
+                // B. F-16M King Viper
+                if (acLower.Contains("f-16") || acLower.Contains("kingviper") || acLower.Contains("aryx_f16m"))
                 {
                     if (unitLower.Contains("revetment")) return true;
                     if (unitLower.Contains("shelter")) return true;
@@ -599,7 +824,7 @@ namespace SpawnControl
                     return false;
                 }
 
-                // C. FQ-106 Kestrel (and any generic FQ-106)
+                // C. FQ-106 Kestrel
                 if (acLower.Contains("fq-106") || acLower.Contains("kestrel"))
                 {
                     if (unitLower.Contains("revetment")) return true;
@@ -609,27 +834,58 @@ namespace SpawnControl
                     return false;
                 }
 
-                // D. FS-3 Ternion (and any generic FS-3)
-                if (acLower.Contains("fs-3") || acLower.Contains("ternion"))
+                // D. FS-3 Ternion
+                if (acLower.Contains("fs-3") || acLower.Contains("ternion") || acLower.Contains("p_trisurface1"))
                 {
                     if (unitLower.Contains("hangar_med") || unitLower.Contains("medium aircraft hangar")) return true;
                     return false;
                 }
 
-                // E. MC-260 Chimera (and any generic MC-260)
-                if (acLower.Contains("mc-260") || acLower.Contains("chimera"))
+                // E. MC-260 Chimera
+                if (acLower.Contains("mc-260") || acLower.Contains("chimera") || acLower.Contains("mc260") || acLower.Contains("cargoplane"))
                 {
                     if (unitLower.Contains("hangar_med") || unitLower.Contains("medium aircraft hangar")) return true;
                     return false;
                 }
 
-                // F. Default fallback for other modded aircraft
-                if (IsVTOL(ac)) return true;
-                return !isShip;
+                // F. RAH-72 Knockout (LightHelicopter)
+                if (acLower.Contains("knockout") || acLower.Contains("lighthelicopter"))
+                {
+                    if (isShip)
+                    {
+                        return isHelipad || displayLower.Contains("elevator") || displayLower.Contains("deckspawn");
+                    }
+                    return isHelipad;
+                }
+
+                // G. Default fallback for other modded aircraft
+                if (IsVTOL(ac))
+                {
+                    if (isShip)
+                    {
+                        return isHelipad || displayLower.Contains("elevator") || displayLower.Contains("deckspawn");
+                    }
+                    return isHelipad;
+                }
+
+                if (isShip)
+                {
+                    return displayLower.Contains("elevator") || displayLower.Contains("deckspawn");
+                }
+                else
+                {
+                    return unitLower.Contains("hangar_med") || unitLower.Contains("medium aircraft hangar") ||
+                           unitLower.Contains("revetment") || unitLower.Contains("shelter");
+                }
             }
 
             // 3. Vanilla aircraft rules: Default to the spawner's native allowed aircraft list
-            return nativeAllowed != null && nativeAllowed.Any(nativeAc => nativeAc != null && string.Equals(nativeAc.unitName, acKey, StringComparison.OrdinalIgnoreCase));
+            if (nativeAllowed != null)
+            {
+                return nativeAllowed.Any(nativeAc => nativeAc != null && string.Equals(nativeAc.name, acPrefabName, StringComparison.OrdinalIgnoreCase));
+            }
+
+            return false;
         }
 
         public static string SanitizeConfigKey(string s)
@@ -650,6 +906,7 @@ namespace SpawnControl
             {
                 resolvedUnitName = attachedUnit.definition.unitName;
                 if (string.IsNullOrEmpty(resolvedUnitName)) resolvedUnitName = attachedUnit.definition.name;
+                resolvedUnitName = GetUnitDisplayName(resolvedUnitName);
                 resolvedRootTransform = attachedUnit.transform;
                 
                 if (UnitHangarConfigs.ContainsKey(resolvedUnitName)) return true;
@@ -692,13 +949,301 @@ namespace SpawnControl
             return false;
         }
 
+        public static readonly Dictionary<string, HashSet<string>> BakedAllowedSpawns = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase)
+        {
+            {
+                "Aryx_MiG-15_AircraftDefinition",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hull_RRL/hangar_R1",
+                    "Medium Aircraft Hangar|hangar_med",
+                    "Aircraft Revetment|revetment1",
+                    "Hardened Aircraft Shelter|shelter1",
+                    "Hyperion Class Carrier|hull_R/hull_RRR/hangar_R1",
+                }
+            },
+            {
+                "SmallFighter1",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Cursor Class LFD|hangar",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hull_RRL/hangar_R1",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hangar_RR/hangar_R2",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hangar_RR/hangar_R3",
+                    "Medium Aircraft Hangar|hangar_med",
+                    "Helipad|Helipad",
+                    "Hardened Aircraft Shelter|shelter1",
+                    "Andromeda class Cruiser|Hangar_Deck_F1",
+                    "Andromeda class Cruiser|Hangar_Deck_F2",
+                    "Andromeda class Cruiser|Aryx_StrikeCarrier1_Hull_Rear/Hangar_Main",
+                }
+            },
+            {
+                "Trainer",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Medium Aircraft Hangar|hangar_med",
+                    "Aircraft Revetment|revetment1",
+                    "Hardened Aircraft Shelter|shelter1",
+                    "Hyperion Class Carrier|hull_R/hull_R2/hull_RRRL/hangar_R2",
+                    "Hyperion Class Carrier|hull_R/hull_R2/hull_RRRR/hangar_R3",
+                    "Hyperion Class Carrier|hull_R/hull_RRR/hangar_R1",
+                    "Devotion Class Light Carrier|Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_Rear_R/Hangar_F",
+                    "Devotion Class Light Carrier|Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_Rear_R/Hangar_R_01",
+                    "Devotion Class Light Carrier|Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_Rear_R/Hangar_R_02",
+                    "Andromeda class Cruiser|Aryx_StrikeCarrier1_Hull_Rear/Hangar_Main",
+                }
+            },
+            {
+                "P_Trisurface1_definition",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Medium Aircraft Hangar|hangar_med",
+                }
+            },
+            {
+                "Multirole1",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Medium Aircraft Hangar|hangar_med",
+                    "Hardened Aircraft Shelter|shelter1",
+                    "Hyperion Class Carrier|hull_R/hull_R2/hull_RRRL/hangar_R2",
+                    "Hyperion Class Carrier|hull_R/hull_R2/hull_RRRR/hangar_R3",
+                    "Hyperion Class Carrier|hull_R/hull_RRR/hangar_R1",
+                    "Devotion Class Light Carrier|Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_Rear_R/Hangar_F",
+                    "Devotion Class Light Carrier|Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_Rear_R/Hangar_R_01",
+                    "Devotion Class Light Carrier|Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_Rear_R/Hangar_R_02",
+                }
+            },
+            {
+                "FastBomber1",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Medium Aircraft Hangar|hangar_med",
+                }
+            },
+            {
+                "EW1",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Annex Class Carrier|hangar_M",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hangar_RR/hangar_R3",
+                    "Medium Aircraft Hangar|hangar_med",
+                    "Hyperion Class Carrier|hull_R/hull_R2/hull_RRRL/hangar_R2",
+                    "Hyperion Class Carrier|hull_R/hull_R2/hull_RRRR/hangar_R3",
+                    "Hyperion Class Carrier|hull_R/hull_RRR/hangar_R1",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hull_RRL/hangar_R1",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hangar_RR/hangar_R2",
+                    "Helipad|Helipad",
+                }
+            },
+            {
+                "Aryx_MC260_Chimera_Definition",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Medium Aircraft Hangar|hangar_med",
+                }
+            },
+            {
+                "CI-22",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hull_RRL/hangar_R1",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hangar_RR/hangar_R2",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hangar_RR/hangar_R3",
+                    "Medium Aircraft Hangar|hangar_med",
+                    "Aircraft Revetment|revetment1",
+                    "Hardened Aircraft Shelter|shelter1",
+                    "Hyperion Class Carrier|hull_R/hull_R2/hull_RRRL/hangar_R2",
+                    "Hyperion Class Carrier|hull_R/hull_R2/hull_RRRR/hangar_R3",
+                    "Hyperion Class Carrier|hull_R/hull_RRR/hangar_R1",
+                    "Devotion Class Light Carrier|Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_Rear_R/Hangar_F",
+                    "Devotion Class Light Carrier|Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_Rear_R/Hangar_R_01",
+                    "Devotion Class Light Carrier|Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_Rear_R/Hangar_R_02",
+                    "Andromeda class Cruiser|Aryx_StrikeCarrier1_Hull_Rear/Hangar_Main",
+                }
+            },
+            {
+                "COIN",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hull_RRL/hangar_R1",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hangar_RR/hangar_R2",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hangar_RR/hangar_R3",
+                    "Medium Aircraft Hangar|hangar_med",
+                    "Aircraft Revetment|revetment1",
+                    "Hardened Aircraft Shelter|shelter1",
+                    "Hyperion Class Carrier|hull_R/hull_R2/hull_RRRL/hangar_R2",
+                    "Hyperion Class Carrier|hull_R/hull_R2/hull_RRRR/hangar_R3",
+                    "Hyperion Class Carrier|hull_R/hull_RRR/hangar_R1",
+                    "Devotion Class Light Carrier|Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_Rear_R/Hangar_F",
+                    "Devotion Class Light Carrier|Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_Rear_R/Hangar_R_01",
+                    "Devotion Class Light Carrier|Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_Rear_R/Hangar_R_02",
+                    "Andromeda class Cruiser|Aryx_StrikeCarrier1_Hull_Rear/Hangar_Main",
+                }
+            },
+            {
+                "Aryx_F16M_KingViper_AircraftDefinition",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hull_RRL/hangar_R1",
+                    "Medium Aircraft Hangar|hangar_med",
+                    "Aircraft Revetment|revetment1",
+                    "Hardened Aircraft Shelter|shelter1",
+                    "Hyperion Class Carrier|hull_R/hull_RRR/hangar_R1",
+                }
+            },
+            {
+                "AttackHelo1",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Argus Class Frigate|frigate1_hull_R/frigate1_hangar",
+                    "Cursor Class LFD|hangar",
+                    "Annex Class Carrier|hangar_M",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hangar_RR/hangar_R3",
+                    "Annex Class Carrier|hull_L/hull_FR/hangar_F",
+                    "Helipad|Helipad",
+                    "Dynamo Class Destroyer|Hull_CR/Hull_hangarFloor",
+                    "Hyperion Class Carrier|hull_R/hull_RRR/hangar_R1",
+                    "Hyperion Class Carrier|hull_F/hangar_F",
+                    "Devotion Class Light Carrier|Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_BR/Hangar_H",
+                    "Andromeda class Cruiser|Hangar_Deck_H1",
+                    "Andromeda class Cruiser|Aryx_StrikeCarrier1_Hull_Rear/Hangar_Heli",
+                    "Atlas Class Supply Ship|Aryx_SupplyShip1_Rear/Aryx_SupplyShip1_Stern/Hangar_R",
+                    "Field Deployable Airpad|Aryx_MC260_Airpad_1",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hull_RRL/hangar_R1",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hangar_RR/hangar_R2",
+                    "Hyperion Class Carrier|hull_R/hull_R2/hull_RRRL/hangar_R2",
+                    "Hyperion Class Carrier|hull_R/hull_R2/hull_RRRR/hangar_R3",
+                }
+            },
+            {
+                "Aryx_LightHelicopter1_Definition",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Helipad|Helipad",
+                }
+            },
+            {
+                "kestrel_definition",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hull_RRL/hangar_R1",
+                    "Medium Aircraft Hangar|hangar_med",
+                    "Aircraft Revetment|revetment1",
+                    "Hardened Aircraft Shelter|shelter1",
+                    "Hyperion Class Carrier|hull_R/hull_RRR/hangar_R1",
+                }
+            },
+            {
+                "CAS1",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Medium Aircraft Hangar|hangar_med",
+                    "Aircraft Revetment|revetment1",
+                    "Hardened Aircraft Shelter|shelter1",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hull_RRL/hangar_R1",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hangar_RR/hangar_R2",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hangar_RR/hangar_R3",
+                }
+            },
+            {
+                "SFB",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Medium Aircraft Hangar|hangar_med",
+                }
+            },
+            {
+                "UtilityHelo1",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Helipad|Helipad",
+                    "Dynamo Class Destroyer|Hull_CR/Hull_hangarFloor",
+                    "Hyperion Class Carrier|hull_R/hull_RRR/hangar_R1",
+                    "Hyperion Class Carrier|hull_F/hangar_F",
+                    "Devotion Class Light Carrier|Aryx_EscortCarrier_Hull_B/Aryx_EscortCarrier_Hull_BR/Hangar_H",
+                    "Ironside Class Frigate|Aryx_Frigate2_Hangar/Hangar",
+                    "Andromeda class Cruiser|Hangar_Deck_H1",
+                    "Andromeda class Cruiser|Aryx_StrikeCarrier1_Hull_Rear/Hangar_Heli",
+                    "Atlas Class Supply Ship|Aryx_SupplyShip1_Rear/Aryx_SupplyShip1_Stern/Hangar_R",
+                    "Atlas Class Supply Ship|Aryx_SupplyShip1_Hangar_Floor/Hangar_F",
+                    "Field Deployable Airpad|Aryx_MC260_Airpad_1",
+                    "Argus Class Frigate|frigate1_hull_R/frigate1_hangar",
+                    "Cursor Class LFD|hangar",
+                    "Annex Class Carrier|hangar_M",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hull_RRL/hangar_R1",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hangar_RR/hangar_R2",
+                    "Annex Class Carrier|hull_RL/hull_RR/hull_wellDeck/hangar_RR/hangar_R3",
+                    "Hyperion Class Carrier|hull_R/hull_R2/hull_RRRL/hangar_R2",
+                    "Hyperion Class Carrier|hull_R/hull_R2/hull_RRRR/hangar_R3",
+                }
+            },
+            {
+                "QuadVTOL1",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Annex Class Carrier|hangar_M",
+                    "Helipad|Helipad",
+                    "Atlas Class Supply Ship|Aryx_SupplyShip1_Rear/Aryx_SupplyShip1_Stern/Hangar_R",
+                    "Atlas Class Supply Ship|Aryx_SupplyShip1_Hangar_Floor/Hangar_F",
+                }
+            },
+            {
+                "FS-12",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Medium Aircraft Hangar|hangar_med",
+                    "Aircraft Revetment|revetment1",
+                    "Hardened Aircraft Shelter|shelter1",
+                }
+            },
+            {
+                "Fighter1",
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    "Medium Aircraft Hangar|hangar_med",
+                    "Aircraft Revetment|revetment1",
+                    "Hardened Aircraft Shelter|shelter1",
+                }
+            },
+        };
+
+        // Checks if an aircraft is natively/default predesignated to spawn at a specific location
+        public static bool IsPredesignatedPlace(string acPrefabName, string unitName, string relativePath, bool isShip, bool isHelipad, AircraftDefinition ac)
+        {
+            // 1. Check the global NativeAllowedCache populated from all prefabs at startup
+            if (NativeAllowedCache.TryGetValue(unitName, out var pathDict))
+            {
+                if (pathDict.TryGetValue(relativePath, out var allowedSet))
+                {
+                    if (allowedSet.Contains(acPrefabName))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            // 2. Check the prebaked allowed spawns database
+            if (BakedAllowedSpawns.TryGetValue(acPrefabName, out var bakedSet))
+            {
+                string key = $"{unitName}|{relativePath}";
+                if (bakedSet.Contains(key))
+                {
+                    return true;
+                }
+            }
+
+            // 3. Fallback to baked rules (for modded aircraft defaults or when not in cache)
+            return GetBakedDefaultAllowed(acPrefabName, unitName, relativePath, isShip, isHelipad, ac, null);
+        }
+
         public static bool IsAircraftAllowed(Hangar hangar, AircraftDefinition definition)
         {
             if (hangar == null || definition == null) return false;
-            if (AllowAllEverywhere.Value) return true;
 
-            string acKey = definition.unitName;
-            if (string.IsNullOrEmpty(acKey)) acKey = definition.name;
+            string acKey = definition.name; // Rely entirely on prefab name!
+            if (string.IsNullOrEmpty(acKey)) acKey = definition.unitName;
 
             // Check Faction Restrictions first (global aircraft cheap reject)
             if (AircraftFactionRestrictions.TryGetValue(acKey, out var factionEntry))
@@ -740,15 +1285,33 @@ namespace SpawnControl
                 else
                 {
                     string attachedName = attachedUnit.name;
-                    isShip = attachedName != null && attachedName.IndexOf("carrier", StringComparison.OrdinalIgnoreCase) >= 0;
+                    isShip = attachedName != null && (attachedName.IndexOf("carrier", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                      attachedName.IndexOf("destroyer", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                      attachedName.IndexOf("frigate", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                      attachedName.IndexOf("corvette", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                      attachedName.IndexOf("cutter", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                      attachedName.IndexOf("cruiser", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                      attachedName.IndexOf("supply ship", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                      attachedName.IndexOf("supplyship", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                      attachedName.IndexOf("landing craft", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                                      attachedName.IndexOf("otb-31", StringComparison.OrdinalIgnoreCase) >= 0);
                 }
             }
 
             if (ResolveHangarConfigContext(hangar, out string unitName, out Transform configRootTransform))
             {
                 string relativePath = GetRelativePath(hangar.transform, configRootTransform);
+                string hangarName = hangar.name;
+                bool isHelipad = hangarName != null && hangarName.IndexOf("helipad", StringComparison.OrdinalIgnoreCase) >= 0;
 
-                // Process God-Mode Toggles
+                // 1. If Debug Auditor Mode is active:
+                if (DebugAuditorMode.Value)
+                {
+                    return IsPredesignatedPlace(acKey, unitName, relativePath, isShip, isHelipad, definition);
+                }
+
+                // 2. Process God-Mode Toggles
+                if (AllowAllEverywhere.Value) return true;
                 if (isShip && AllowShipsToSpawnAll.Value) return true;
                 if (!isShip && AllowLandBasesToSpawnAll.Value) return true;
 
@@ -786,7 +1349,7 @@ namespace SpawnControl
                         }
                     }
 
-                    // DYNAMIC CONFIG BINDING: Safely bind configuration with exact runtime vanilla outcome as default!
+                    // DYNAMIC CONFIG BINDING: Safely bind configuration with exact runtime predesignated outcome as default!
                     if (!unitDict.TryGetValue(relativePath, out var targetHangarDict))
                     {
                         targetHangarDict = new Dictionary<string, ConfigEntry<bool>>();
@@ -795,7 +1358,9 @@ namespace SpawnControl
 
                     if (!targetHangarDict.TryGetValue(acKey, out configEntry))
                     {
-                        string sectionName = acKey.Contains("???") ? $"9. UFO - {acKey}" : $"1. Aircraft - {acKey}";
+                        string friendlyName = PrefabToDisplayName.TryGetValue(acKey, out string fn) ? fn : definition.unitName;
+                        if (string.IsNullOrEmpty(friendlyName)) friendlyName = acKey;
+                        string sectionName = acKey.Contains("UFO") || acKey.Contains("???") ? $"9. UFO - {acKey}" : $"1. Aircraft - {friendlyName} ({acKey})";
 
                         string displayName = $"{unitName} - {relativePath}";
                         if (HangarMetadataByPath.TryGetValue(unitName, out var pathDict) && pathDict.TryGetValue(relativePath, out var info))
@@ -804,18 +1369,13 @@ namespace SpawnControl
                         }
                         string keyName = SanitizeConfigKey(displayName);
 
-                        // Resolve variables for dynamic baked defaults
-                        string hangarName2 = hangar.name;
-                        bool isHelipad2 = hangarName2 != null && hangarName2.IndexOf("helipad", StringComparison.OrdinalIgnoreCase) >= 0;
-
-                        AircraftDefinition[] nativeAllowed = HangarAvailableAircraftRef(hangar);
-                        bool defaultAllowed = GetBakedDefaultAllowed(acKey, unitName, displayName, isShip, isHelipad2, definition, nativeAllowed);
+                        bool defaultAllowed = IsPredesignatedPlace(acKey, unitName, relativePath, isShip, isHelipad, definition);
 
                         configEntry = Instance.Config.Bind(
                             sectionName,
                             keyName,
                             defaultAllowed, 
-                            new ConfigDescription($"Allow {acKey} to spawn at {displayName}.", null)
+                            new ConfigDescription($"Allow {friendlyName} ({acKey}) to spawn at {displayName}.", null)
                         );
 
                         targetHangarDict[acKey] = configEntry;
@@ -826,33 +1386,44 @@ namespace SpawnControl
                 }
             }
 
-            // 2. Global VTOL Settings
-            string hangarName = hangar.name;
-            bool isHelipad = hangarName != null && hangarName.IndexOf("helipad", StringComparison.OrdinalIgnoreCase) >= 0;
+            // 1b. Debug Auditor Mode fallback if context not resolved
+            if (DebugAuditorMode.Value)
+            {
+                AircraftDefinition[] origList = HangarAvailableAircraftRef(hangar);
+                if (origList != null)
+                {
+                    return origList.Any(nativeAc => nativeAc != null && string.Equals(nativeAc.name, acKey, StringComparison.OrdinalIgnoreCase));
+                }
+                return false;
+            }
 
-            if (isHelipad && AllowAllVTOLsOnHelipads.Value && IsVTOL(definition))
+            // 2b. God-Mode Toggles fallback
+            if (AllowAllEverywhere.Value) return true;
+
+            // 3. Global VTOL Settings
+            string hangarName2 = hangar.name;
+            bool isHelipad2 = hangarName2 != null && hangarName2.IndexOf("helipad", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (isHelipad2 && AllowAllVTOLsOnHelipads.Value && IsVTOL(definition))
             {
                 return true;
             }
 
-            // 3. Absolute Final Fallback: Vanilla Game Rules
-            AircraftDefinition[] origList = HangarAvailableAircraftRef(hangar);
-            if (origList != null)
+            // 4. Absolute Final Fallback: Vanilla Game Rules
+            AircraftDefinition[] origList2 = HangarAvailableAircraftRef(hangar);
+            if (origList2 != null)
             {
-                return origList.Any(nativeAc => nativeAc != null && string.Equals(nativeAc.unitName, acKey, StringComparison.OrdinalIgnoreCase));
+                return origList2.Any(nativeAc => nativeAc != null && string.Equals(nativeAc.name, acKey, StringComparison.OrdinalIgnoreCase));
             }
 
             return false;
         }
 
         // Filters a vanilla-provided aircraft array through our permission config.
-        // IMPORTANT: We must NEVER replace the vanilla result entirely — the vanilla
-        // result already has occupancy filtering applied (no spawning in occupied slots).
-        // We only remove aircraft that our config says are not allowed at this hangar.
         public static AircraftDefinition[] FilterAllowedAircraft(Hangar hangar, AircraftDefinition[] vanillaResult)
         {
             if (hangar == null || vanillaResult == null) return vanillaResult;
-            if (AllowAllEverywhere.Value) return vanillaResult;
+            if (AllowAllEverywhere.Value && !DebugAuditorMode.Value) return vanillaResult;
 
             List<AircraftDefinition> allowed = new List<AircraftDefinition>(vanillaResult.Length);
             for (int i = 0; i < vanillaResult.Length; i++)
@@ -865,21 +1436,18 @@ namespace SpawnControl
         }
 
         // Builds the full permitted list for a hangar from the global aircraft pool.
-        // Used ONLY for GetAvailableAircraft when we need to ADD modded aircraft
-        // that the vanilla list omits entirely (not present in the native array).
-        // Occupancy is NOT checked here — this is for the display menu only.
         public static AircraftDefinition[] GetAllAllowedAircraftForHangar(Hangar hangar)
         {
             if (hangar == null) return new AircraftDefinition[0];
 
             var aircraftList = allAircraft.Count > 0 ? allAircraft : Resources.FindObjectsOfTypeAll<AircraftDefinition>().ToList();
-            if (AllowAllEverywhere.Value) return aircraftList.ToArray();
+            if (AllowAllEverywhere.Value && !DebugAuditorMode.Value) return aircraftList.ToArray();
 
             List<AircraftDefinition> allowed = new List<AircraftDefinition>(aircraftList.Count);
             for (int i = 0; i < aircraftList.Count; i++)
             {
                 var def = aircraftList[i];
-                if (def == null || string.IsNullOrEmpty(def.unitName)) continue;
+                if (def == null || string.IsNullOrEmpty(def.name)) continue;
                 if (IsAircraftAllowed(hangar, def)) allowed.Add(def);
             }
             return allowed.ToArray();
@@ -888,6 +1456,78 @@ namespace SpawnControl
         // =========================================================================
         // ACTIVE HARMONY OVERRIDE PATCHES
         // =========================================================================
+
+        [HarmonyPatch(typeof(Hangar), "SpawnAircraft")]
+        [HarmonyPostfix]
+        static void Hangar_SpawnAircraft_Postfix(Hangar __instance, AircraftDefinition definition)
+        {
+            if (__instance == null || definition == null) return;
+
+            string acKey = definition.name;
+            if (string.IsNullOrEmpty(acKey)) acKey = definition.unitName;
+
+            string friendlyName = PrefabToDisplayName.TryGetValue(acKey, out string fn) ? fn : definition.unitName;
+            if (string.IsNullOrEmpty(friendlyName)) friendlyName = acKey;
+
+            string spawnUnitName = "";
+            Unit attachedUnit = __instance.attachedUnit ?? __instance.GetComponentInParent<Unit>();
+            if (attachedUnit != null && attachedUnit.definition != null)
+            {
+                spawnUnitName = attachedUnit.definition.unitName;
+                if (string.IsNullOrEmpty(spawnUnitName)) spawnUnitName = attachedUnit.definition.name;
+                spawnUnitName = GetUnitDisplayName(spawnUnitName);
+            }
+
+            Log.LogInfo($"[AUDITOR-SPAWN-SCAN] Spawned '{friendlyName}' ({acKey}) at hangar '{__instance.name}' under parent '{spawnUnitName}'");
+            Log.LogInfo($"[AUDITOR-SPAWN-SCAN] Allowed spawn locations for '{friendlyName}' ({acKey}):");
+
+            int count = 0;
+            foreach (var unitKvp in NativeAllowedCache)
+            {
+                string unitName = unitKvp.Key;
+                foreach (var pathKvp in unitKvp.Value)
+                {
+                    string path = pathKvp.Key;
+
+                    bool isShip = unitName.ToLower().Contains("carrier") || 
+                                  unitName.ToLower().Contains("destroyer") || 
+                                  unitName.ToLower().Contains("frigate") || 
+                                  unitName.ToLower().Contains("corvette") || 
+                                  unitName.ToLower().Contains("cutter") || 
+                                  unitName.ToLower().Contains("cruiser") || 
+                                  unitName.ToLower().Contains("supply ship") ||
+                                  unitName.ToLower().Contains("supplyship") ||
+                                  unitName.ToLower().Contains("landing craft") ||
+                                  unitName.ToLower().Contains("otb-31");
+
+                    bool isHelipad = path.ToLower().Contains("helipad");
+                    if (!isHelipad)
+                    {
+                        if (HangarMetadataByPath.TryGetValue(unitName, out var pathDict) && pathDict.TryGetValue(path, out var info))
+                        {
+                            isHelipad = info.HangarType == "helipad" || info.ConfigName.ToLower().Contains("helipad");
+                        }
+                    }
+
+                    if (IsPredesignatedPlace(acKey, unitName, path, isShip, isHelipad, definition))
+                    {
+                        string displayName = path;
+                        if (HangarMetadataByPath.TryGetValue(unitName, out var pathDict) && pathDict.TryGetValue(path, out var info))
+                        {
+                            displayName = info.ConfigName;
+                        }
+                        Log.LogInfo($"  - {unitName} -> {displayName} (path: {path})");
+                        count++;
+                    }
+                }
+            }
+
+            if (count == 0)
+            {
+                Log.LogInfo("You suck lmao");
+            }
+        }
+
 
         [HarmonyPatch(typeof(Hangar), nameof(Hangar.CanSpawnAircraft))]
         [HarmonyPostfix]
