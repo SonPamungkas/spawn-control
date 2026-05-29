@@ -16,6 +16,7 @@ namespace SpawnControl
     {
         public static SpawnControlPlugin Instance;
         public static ManualLogSource Log;
+        public static bool isConfigsInitialized = false;
 
         // Global Configuration Overrides
         public static ConfigEntry<bool> ResetAllSettings;
@@ -218,18 +219,28 @@ namespace SpawnControl
 
         private IEnumerator InitSpawnControlConfigs()
         {
-            Log.LogInfo("SpawnControl: Waiting for Blueprinter assets to load and stabilize...");
+            Log.LogInfo("SpawnControl: Initiating deferred startup sequence. Waiting 5 seconds...");
+            yield return new WaitForSeconds(5.0f);
 
-            // 1. Wait until both AircraftDefinition and UnitDefinition counts stabilize (non-zero and unchanging) with hard timeout
+            while (UnityEngine.SceneManagement.SceneManager.GetActiveScene().name != "MainMenu")
+            {
+                yield return new WaitForSeconds(1.0f);
+            }
+
+            Log.LogInfo("SpawnControl: MainMenu scene detected. Waiting 20 seconds for Blueprinter/qol asset loading to stabilize...");
+            yield return new WaitForSeconds(20.0f);
+
+            Log.LogInfo("SpawnControl: Stabilization period complete. Discovering assets...");
+
             UnitDefinition[] allUnits = null;
             AircraftDefinition[] allAircraftList = null;
 
             int stableCount = 0;
             int lastUnitsCount = 0;
             int lastAircraftCount = 0;
-            int waitSeconds = 0;
+            int checkIterations = 0;
 
-            while (waitSeconds < 15) // 15 seconds safety timeout to prevent infinite hang at startup
+            while (checkIterations < 15) // Check for up to 30 seconds
             {
                 allUnits = Resources.FindObjectsOfTypeAll<UnitDefinition>();
                 allAircraftList = Resources.FindObjectsOfTypeAll<AircraftDefinition>();
@@ -242,7 +253,7 @@ namespace SpawnControl
                     if (uCount == lastUnitsCount && aCount == lastAircraftCount)
                     {
                         stableCount++;
-                        if (stableCount >= 3) // Stable for 3 seconds
+                        if (stableCount >= 3) // Stable for 3 checks (6 seconds)
                         {
                             break;
                         }
@@ -259,8 +270,8 @@ namespace SpawnControl
                     stableCount = 0;
                 }
 
-                waitSeconds++;
-                yield return new WaitForSeconds(1.0f);
+                checkIterations++;
+                yield return new WaitForSeconds(2.0f);
             }
 
             Log.LogInfo($"SpawnControl: Stable at {lastAircraftCount} aircraft and {lastUnitsCount} units. Pre-generating hangar options...");
@@ -271,6 +282,7 @@ namespace SpawnControl
             // 1. POPULATE GLOBAL NATIVE ALLOWED CACHE DIRECTLY FROM PREFABS
             var validUnits = allUnits
                 .Where(def => def != null && def.unitPrefab != null && !string.IsNullOrEmpty(def.unitName))
+                .Where(def => !IsSegregatedUnit(def))
                 .Where(def => def.unitPrefab.GetComponentsInChildren<Hangar>(true).Length > 0)
                 .ToList();
 
@@ -319,6 +331,7 @@ namespace SpawnControl
             // Rely entirely on prefab name (ac.name)
             var sortedAircraft = allAircraftList
                 .Where(a => a != null && !string.IsNullOrEmpty(a.name))
+                .Where(a => !IsSegregated(a))
                 .GroupBy(a => a.name).Select(g => g.First()) 
                 .OrderBy(a => a.name.Contains("UFO") || a.name.Contains("???") ? 1 : 0) // Push UFO to bottom visually
                 .ThenBy(a => a.name) 
@@ -544,6 +557,7 @@ namespace SpawnControl
             }
 
             SpawnControlPlugin.allAircraft = sortedAircraft;
+            isConfigsInitialized = true;
             Log.LogInfo($"SpawnControl: Configuration pre-generation complete. Bound {sortedAircraft.Count} aircraft against {sortedLocations.Count} locations.");
         }
 
@@ -655,6 +669,187 @@ namespace SpawnControl
             if (!string.IsNullOrEmpty(ac.name) && VanillaPrefabNames.Contains(ac.name)) return true;
             return false;
         }
+
+        private static Type boteModAssetsType = null;
+        private static bool searchedBoteModAssets = false;
+
+        private static Type GetBoteModAssetsType()
+        {
+            if (searchedBoteModAssets) return boteModAssetsType;
+            searchedBoteModAssets = true;
+            try
+            {
+                foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    if (assembly.IsDynamic) continue;
+                    string name = assembly.FullName;
+                    if (name.StartsWith("System") || name.StartsWith("mscorlib") || name.StartsWith("UnityEngine")) continue;
+                    
+                    var type = assembly.GetType("NOComponentWIP.ModAssets");
+                    if (type != null)
+                    {
+                        boteModAssetsType = type;
+                        break;
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                // Silence errors
+            }
+            return boteModAssetsType;
+        }
+
+        private static bool IsInBoteShipDefinitions(AircraftDefinition definition)
+        {
+            if (definition == null) return false;
+            Type boteType = GetBoteModAssetsType();
+            if (boteType == null) return false;
+
+            try
+            {
+                var instanceProp = boteType.GetProperty("i", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                if (instanceProp != null)
+                {
+                    var instance = instanceProp.GetValue(null);
+                    if (instance != null)
+                    {
+                        var shipDefsField = boteType.GetField("shipDefinitions", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                        if (shipDefsField != null)
+                        {
+                            var shipDefs = shipDefsField.GetValue(instance) as AircraftDefinition[];
+                            if (shipDefs != null)
+                            {
+                                foreach (var sd in shipDefs)
+                                {
+                                    if (sd != null && string.Equals(sd.name, definition.name, StringComparison.OrdinalIgnoreCase))
+                                        return true;
+                                }
+                            }
+                        }
+                        var shipDefsWithDeployerField = boteType.GetField("shipDefinitionsWithDeployer", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                        if (shipDefsWithDeployerField != null)
+                        {
+                            var shipDefsWithDeployer = shipDefsWithDeployerField.GetValue(instance) as AircraftDefinition[];
+                            if (shipDefsWithDeployer != null)
+                            {
+                                foreach (var sd in shipDefsWithDeployer)
+                                {
+                                    if (sd != null && string.Equals(sd.name, definition.name, StringComparison.OrdinalIgnoreCase))
+                                        return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                // Silence reflection errors
+            }
+            return false;
+        }
+
+        public static bool IsSegregated(AircraftDefinition definition)
+        {
+            if (definition == null) return false;
+
+            if (!string.IsNullOrEmpty(definition.jsonKey) && definition.jsonKey.StartsWith("kar_", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (!string.IsNullOrEmpty(definition.name) && definition.name.StartsWith("kar_", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (!string.IsNullOrEmpty(definition.jsonKey) && definition.jsonKey.StartsWith("bote_", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (!string.IsNullOrEmpty(definition.name) && definition.name.StartsWith("bote_", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (IsInBoteShipDefinitions(definition))
+                return true;
+
+            if (definition.unitPrefab != null)
+            {
+                if (definition.unitPrefab.GetComponent("ShipPartBridge") != null)
+                    return true;
+            }
+
+            return false;
+        }
+
+        public static bool IsSegregatedUnit(UnitDefinition definition)
+        {
+            if (definition == null) return false;
+
+            if (!string.IsNullOrEmpty(definition.jsonKey) && definition.jsonKey.StartsWith("kar_", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (!string.IsNullOrEmpty(definition.name) && definition.name.StartsWith("kar_", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (!string.IsNullOrEmpty(definition.jsonKey) && definition.jsonKey.StartsWith("bote_", StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (!string.IsNullOrEmpty(definition.name) && definition.name.StartsWith("bote_", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            if (definition is AircraftDefinition acDef && IsInBoteShipDefinitions(acDef))
+                return true;
+
+            if (definition.unitPrefab != null)
+            {
+                if (definition.unitPrefab.GetComponent("ShipPartBridge") != null)
+                    return true;
+            }
+
+            return false;
+        }
+
+        public static bool IsSegregated(Hangar hangar)
+        {
+            if (hangar == null) return false;
+
+            string typeName = hangar.GetType().FullName;
+            if (!string.IsNullOrEmpty(typeName))
+            {
+                if (typeName.StartsWith("NOComponentWIP", StringComparison.OrdinalIgnoreCase) ||
+                    typeName.StartsWith("Blueprinter.Kar", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            Unit attachedUnit = hangar.attachedUnit ?? hangar.GetComponentInParent<Unit>();
+            if (attachedUnit != null && attachedUnit.definition != null)
+            {
+                if (IsSegregatedUnit(attachedUnit.definition))
+                    return true;
+            }
+
+            return false;
+        }
+
+        public static bool IsSegregated(Airbase airbase)
+        {
+            if (airbase == null) return false;
+
+            string typeName = airbase.GetType().FullName;
+            if (!string.IsNullOrEmpty(typeName))
+            {
+                if (typeName.StartsWith("NOComponentWIP", StringComparison.OrdinalIgnoreCase) ||
+                    typeName.StartsWith("Blueprinter.Kar", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            Unit attachedUnit = airbase.GetComponent<Unit>() ?? airbase.GetComponentInParent<Unit>();
+            if (attachedUnit != null && attachedUnit.definition != null)
+            {
+                if (IsSegregatedUnit(attachedUnit.definition))
+                    return true;
+            }
+
+            return false;
+        }
+
         public static readonly Dictionary<string, string> ShipPrefabToDisplayName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             { "Aryx_StrikeCarrier1", "Aryx Strike Carrier" },
@@ -784,6 +979,8 @@ namespace SpawnControl
 
         public static bool GetBakedDefaultAllowed(string acPrefabName, string unitName, string displayName, bool isShip, bool isHelipad, AircraftDefinition ac, AircraftDefinition[] nativeAllowed)
         {
+            if (string.IsNullOrEmpty(acPrefabName) || string.IsNullOrEmpty(unitName) || string.IsNullOrEmpty(displayName)) return false;
+
             string acLower = acPrefabName.ToLower();
             string unitLower = unitName.ToLower();
             string displayLower = displayName.ToLower();
@@ -1242,6 +1439,16 @@ namespace SpawnControl
         {
             if (hangar == null || definition == null) return false;
 
+            if (IsSegregated(hangar) || IsSegregated(definition))
+            {
+                AircraftDefinition[] origList = HangarAvailableAircraftRef(hangar);
+                if (origList != null)
+                {
+                    return origList.Any(nativeAc => nativeAc != null && string.Equals(nativeAc.name, definition.name, StringComparison.OrdinalIgnoreCase));
+                }
+                return false;
+            }
+
             string acKey = definition.name; // Rely entirely on prefab name!
             if (string.IsNullOrEmpty(acKey)) acKey = definition.unitName;
 
@@ -1439,15 +1646,20 @@ namespace SpawnControl
         public static AircraftDefinition[] GetAllAllowedAircraftForHangar(Hangar hangar)
         {
             if (hangar == null) return new AircraftDefinition[0];
+            if (IsSegregated(hangar)) return new AircraftDefinition[0];
 
             var aircraftList = allAircraft.Count > 0 ? allAircraft : Resources.FindObjectsOfTypeAll<AircraftDefinition>().ToList();
-            if (AllowAllEverywhere.Value && !DebugAuditorMode.Value) return aircraftList.ToArray();
+            if (AllowAllEverywhere.Value && !DebugAuditorMode.Value)
+            {
+                return aircraftList.Where(a => a != null && !IsSegregated(a)).ToArray();
+            }
 
             List<AircraftDefinition> allowed = new List<AircraftDefinition>(aircraftList.Count);
             for (int i = 0; i < aircraftList.Count; i++)
             {
                 var def = aircraftList[i];
                 if (def == null || string.IsNullOrEmpty(def.name)) continue;
+                if (IsSegregated(def)) continue;
                 if (IsAircraftAllowed(hangar, def)) allowed.Add(def);
             }
             return allowed.ToArray();
@@ -1461,70 +1673,80 @@ namespace SpawnControl
         [HarmonyPostfix]
         static void Hangar_SpawnAircraft_Postfix(Hangar __instance, AircraftDefinition definition)
         {
-            if (__instance == null || definition == null) return;
-
-            string acKey = definition.name;
-            if (string.IsNullOrEmpty(acKey)) acKey = definition.unitName;
-
-            string friendlyName = PrefabToDisplayName.TryGetValue(acKey, out string fn) ? fn : definition.unitName;
-            if (string.IsNullOrEmpty(friendlyName)) friendlyName = acKey;
-
-            string spawnUnitName = "";
-            Unit attachedUnit = __instance.attachedUnit ?? __instance.GetComponentInParent<Unit>();
-            if (attachedUnit != null && attachedUnit.definition != null)
+            try
             {
-                spawnUnitName = attachedUnit.definition.unitName;
-                if (string.IsNullOrEmpty(spawnUnitName)) spawnUnitName = attachedUnit.definition.name;
-                spawnUnitName = GetUnitDisplayName(spawnUnitName);
-            }
+                if (!isConfigsInitialized) return;
+                if (UnityEngine.SceneManagement.SceneManager.GetActiveScene().name == "MainMenu") return;
+                if (__instance == null || definition == null) return;
+                if (IsSegregated(__instance) || IsSegregated(definition)) return;
 
-            Log.LogInfo($"[AUDITOR-SPAWN-SCAN] Spawned '{friendlyName}' ({acKey}) at hangar '{__instance.name}' under parent '{spawnUnitName}'");
-            Log.LogInfo($"[AUDITOR-SPAWN-SCAN] Allowed spawn locations for '{friendlyName}' ({acKey}):");
+                string acKey = definition.name;
+                if (string.IsNullOrEmpty(acKey)) acKey = definition.unitName;
 
-            int count = 0;
-            foreach (var unitKvp in NativeAllowedCache)
-            {
-                string unitName = unitKvp.Key;
-                foreach (var pathKvp in unitKvp.Value)
+                string friendlyName = PrefabToDisplayName.TryGetValue(acKey, out string fn) ? fn : definition.unitName;
+                if (string.IsNullOrEmpty(friendlyName)) friendlyName = acKey;
+
+                string spawnUnitName = "";
+                Unit attachedUnit = __instance.attachedUnit ?? __instance.GetComponentInParent<Unit>();
+                if (attachedUnit != null && attachedUnit.definition != null)
                 {
-                    string path = pathKvp.Key;
+                    spawnUnitName = attachedUnit.definition.unitName;
+                    if (string.IsNullOrEmpty(spawnUnitName)) spawnUnitName = attachedUnit.definition.name;
+                    spawnUnitName = GetUnitDisplayName(spawnUnitName);
+                }
 
-                    bool isShip = unitName.ToLower().Contains("carrier") || 
-                                  unitName.ToLower().Contains("destroyer") || 
-                                  unitName.ToLower().Contains("frigate") || 
-                                  unitName.ToLower().Contains("corvette") || 
-                                  unitName.ToLower().Contains("cutter") || 
-                                  unitName.ToLower().Contains("cruiser") || 
-                                  unitName.ToLower().Contains("supply ship") ||
-                                  unitName.ToLower().Contains("supplyship") ||
-                                  unitName.ToLower().Contains("landing craft") ||
-                                  unitName.ToLower().Contains("otb-31");
+                Log.LogInfo($"[AUDITOR-SPAWN-SCAN] Spawned '{friendlyName}' ({acKey}) at hangar '{__instance.name}' under parent '{spawnUnitName}'");
+                Log.LogInfo($"[AUDITOR-SPAWN-SCAN] Allowed spawn locations for '{friendlyName}' ({acKey}):");
 
-                    bool isHelipad = path.ToLower().Contains("helipad");
-                    if (!isHelipad)
+                int count = 0;
+                foreach (var unitKvp in NativeAllowedCache)
+                {
+                    string unitName = unitKvp.Key;
+                    foreach (var pathKvp in unitKvp.Value)
                     {
-                        if (HangarMetadataByPath.TryGetValue(unitName, out var pathDict) && pathDict.TryGetValue(path, out var info))
-                        {
-                            isHelipad = info.HangarType == "helipad" || info.ConfigName.ToLower().Contains("helipad");
-                        }
-                    }
+                        string path = pathKvp.Key;
 
-                    if (IsPredesignatedPlace(acKey, unitName, path, isShip, isHelipad, definition))
-                    {
-                        string displayName = path;
-                        if (HangarMetadataByPath.TryGetValue(unitName, out var pathDict) && pathDict.TryGetValue(path, out var info))
+                        bool isShip = unitName.ToLower().Contains("carrier") || 
+                                      unitName.ToLower().Contains("destroyer") || 
+                                      unitName.ToLower().Contains("frigate") || 
+                                      unitName.ToLower().Contains("corvette") || 
+                                      unitName.ToLower().Contains("cutter") || 
+                                      unitName.ToLower().Contains("cruiser") || 
+                                      unitName.ToLower().Contains("supply ship") ||
+                                      unitName.ToLower().Contains("supplyship") ||
+                                      unitName.ToLower().Contains("landing craft") ||
+                                      unitName.ToLower().Contains("otb-31");
+
+                        bool isHelipad = path.ToLower().Contains("helipad");
+                        if (!isHelipad)
                         {
-                            displayName = info.ConfigName;
+                            if (HangarMetadataByPath.TryGetValue(unitName, out var pathDict) && pathDict.TryGetValue(path, out var info))
+                            {
+                                isHelipad = info.HangarType == "helipad" || info.ConfigName.ToLower().Contains("helipad");
+                            }
                         }
-                        Log.LogInfo($"  - {unitName} -> {displayName} (path: {path})");
-                        count++;
+
+                        if (IsPredesignatedPlace(acKey, unitName, path, isShip, isHelipad, definition))
+                        {
+                            string displayName = path;
+                            if (HangarMetadataByPath.TryGetValue(unitName, out var pathDict) && pathDict.TryGetValue(path, out var info))
+                            {
+                                displayName = info.ConfigName;
+                            }
+                            Log.LogInfo($"  - {unitName} -> {displayName} (path: {path})");
+                            count++;
+                        }
                     }
                 }
-            }
 
-            if (count == 0)
+                if (count == 0)
+                {
+                    Log.LogInfo("You suck lmao");
+                }
+            }
+            catch (Exception ex)
             {
-                Log.LogInfo("You suck lmao");
+                Log.LogError($"Exception in Hangar_SpawnAircraft_Postfix: {ex}");
             }
         }
 
@@ -1533,124 +1755,164 @@ namespace SpawnControl
         [HarmonyPostfix]
         static void Hangar_CanSpawnAircraft_Postfix(Hangar __instance, AircraftDefinition definition, ref bool __result)
         {
-            if (definition == null || __instance == null) return;
-
-            // If the hangar itself is not available (occupied, spawning, or disabled),
-            // no aircraft of any kind can spawn here!
-            if (!__instance.Available)
+            try
             {
-                __result = false;
-                return;
-            }
+                if (!isConfigsInitialized) return;
+                if (UnityEngine.SceneManagement.SceneManager.GetActiveScene().name == "MainMenu") return;
+                if (definition == null || __instance == null) return;
+                if (IsSegregated(__instance) || IsSegregated(definition)) return;
 
-            __result = IsAircraftAllowed(__instance, definition);
+                // If the hangar itself is not available (occupied, spawning, or disabled),
+                // no aircraft of any kind can spawn here!
+                if (!__instance.Available)
+                {
+                    __result = false;
+                    return;
+                }
+
+                __result = IsAircraftAllowed(__instance, definition);
+            }
+            catch (Exception ex)
+            {
+                Log.LogError($"Exception in Hangar_CanSpawnAircraft_Postfix: {ex}");
+            }
         }
 
         [HarmonyPatch(typeof(Hangar), nameof(Hangar.GetAvailableAircraft))]
         [HarmonyPostfix]
         static void Hangar_GetAvailableAircraft_Postfix(Hangar __instance, ref AircraftDefinition[] __result)
         {
-            if (__instance == null) return;
-
-            // If the hangar itself is not available (occupied, spawning, or disabled),
-            // no aircraft of any kind can spawn here!
-            if (!__instance.Available)
+            try
             {
-                __result = new AircraftDefinition[0];
-                return;
-            }
+                if (!isConfigsInitialized) return;
+                if (UnityEngine.SceneManagement.SceneManager.GetActiveScene().name == "MainMenu") return;
+                if (__instance == null) return;
+                if (IsSegregated(__instance)) return;
 
-            // Filter vanilla result (which has occupancy applied) through our config.
-            // Then union with any modded aircraft our config permits that vanilla omits.
-            var filtered = FilterAllowedAircraft(__instance, __result);
-            var fullList = GetAllAllowedAircraftForHangar(__instance);
-            // Add modded aircraft not in vanilla result, but only if they are permitted
-            var resultSet = new HashSet<AircraftDefinition>(filtered);
-            for (int i = 0; i < fullList.Length; i++)
-            {
-                var ac = fullList[i];
-                if (!resultSet.Contains(ac))
-                    resultSet.Add(ac);
+                // If the hangar itself is not available (occupied, spawning, or disabled),
+                // no aircraft of any kind can spawn here!
+                if (!__instance.Available)
+                {
+                    __result = new AircraftDefinition[0];
+                    return;
+                }
+
+                // Filter vanilla result (which has occupancy applied) through our config.
+                // Then union with any modded aircraft our config permits that vanilla omits.
+                var filtered = FilterAllowedAircraft(__instance, __result);
+                var fullList = GetAllAllowedAircraftForHangar(__instance);
+                // Add modded aircraft not in vanilla result, but only if they are permitted
+                var resultSet = new HashSet<AircraftDefinition>(filtered);
+                for (int i = 0; i < fullList.Length; i++)
+                {
+                    var ac = fullList[i];
+                    if (!resultSet.Contains(ac))
+                        resultSet.Add(ac);
+                }
+                __result = System.Linq.Enumerable.ToArray(resultSet);
             }
-            __result = System.Linq.Enumerable.ToArray(resultSet);
+            catch (Exception ex)
+            {
+                Log.LogError($"Exception in Hangar_GetAvailableAircraft_Postfix: {ex}");
+            }
         }
 
         [HarmonyPatch(typeof(Airbase), nameof(Airbase.CanSpawnAircraft))]
         [HarmonyPostfix]
         static void Airbase_CanSpawnAircraft_Postfix(Airbase __instance, AircraftDefinition definition, ref bool __result)
         {
-            if (__instance == null || definition == null) return;
-
-            // If the airbase itself is disabled, no aircraft can spawn!
-            if (__instance.disabled)
+            try
             {
-                __result = false;
-                return;
-            }
+                if (!isConfigsInitialized) return;
+                if (UnityEngine.SceneManagement.SceneManager.GetActiveScene().name == "MainMenu") return;
+                if (__instance == null || definition == null) return;
+                if (IsSegregated(__instance) || IsSegregated(definition)) return;
 
-            List<Hangar> baseHangars = AirbaseHangarsRef(__instance);
-            if (baseHangars == null || baseHangars.Count == 0)
-            {
-                __result = false;
-                return;
-            }
-
-            bool allowed = false;
-            for (int i = 0; i < baseHangars.Count; i++)
-            {
-                var hangar = baseHangars[i];
-                if (hangar == null) continue;
-
-                // Hangar must be available (not occupied, spawning, or disabled)
-                if (!hangar.Available) continue;
-
-                if (IsAircraftAllowed(hangar, definition))
+                // If the airbase itself is disabled, no aircraft can spawn!
+                if (__instance.disabled)
                 {
-                    allowed = true;
-                    break;
+                    __result = false;
+                    return;
                 }
+
+                List<Hangar> baseHangars = AirbaseHangarsRef(__instance);
+                if (baseHangars == null || baseHangars.Count == 0)
+                {
+                    __result = false;
+                    return;
+                }
+
+                bool allowed = false;
+                for (int i = 0; i < baseHangars.Count; i++)
+                {
+                    var hangar = baseHangars[i];
+                    if (hangar == null) continue;
+
+                    // Hangar must be available (not occupied, spawning, or disabled)
+                    if (!hangar.Available) continue;
+
+                    if (IsAircraftAllowed(hangar, definition))
+                    {
+                        allowed = true;
+                        break;
+                    }
+                }
+                __result = allowed;
             }
-            __result = allowed;
+            catch (Exception ex)
+            {
+                Log.LogError($"Exception in Airbase_CanSpawnAircraft_Postfix: {ex}");
+            }
         }
 
         [HarmonyPatch(typeof(Airbase), nameof(Airbase.GetAvailableAircraft))]
         [HarmonyPostfix]
         static void Airbase_GetAvailableAircraft_Postfix(Airbase __instance, ref List<AircraftDefinition> __result)
         {
-            if (__instance == null || __result == null) return;
-
-            List<Hangar> baseHangars = AirbaseHangarsRef(__instance);
-            if (baseHangars == null || baseHangars.Count == 0) return;
-
-            // Filter the vanilla result through our config (preserves occupancy).
-            // Then union with modded aircraft our config permits that vanilla omits.
-            var allowedSet = new HashSet<AircraftDefinition>();
-            for (int i = 0; i < __result.Count; i++)
+            try
             {
-                var ac = __result[i];
-                if (ac == null) continue;
-                for (int j = 0; j < baseHangars.Count; j++)
+                if (!isConfigsInitialized) return;
+                if (UnityEngine.SceneManagement.SceneManager.GetActiveScene().name == "MainMenu") return;
+                if (__instance == null || __result == null) return;
+                if (IsSegregated(__instance)) return;
+
+                List<Hangar> baseHangars = AirbaseHangarsRef(__instance);
+                if (baseHangars == null || baseHangars.Count == 0) return;
+
+                // Filter the vanilla result through our config (preserves occupancy).
+                // Then union with modded aircraft our config permits that vanilla omits.
+                var allowedSet = new HashSet<AircraftDefinition>();
+                for (int i = 0; i < __result.Count; i++)
                 {
-                    var hangar = baseHangars[j];
-                    if (hangar != null && hangar.Available && IsAircraftAllowed(hangar, ac))
+                    var ac = __result[i];
+                    if (ac == null) continue;
+                    for (int j = 0; j < baseHangars.Count; j++)
                     {
-                        allowedSet.Add(ac);
-                        break;
+                        var hangar = baseHangars[j];
+                        if (hangar != null && hangar.Available && IsAircraftAllowed(hangar, ac))
+                        {
+                            allowedSet.Add(ac);
+                            break;
+                        }
                     }
                 }
-            }
-            // Add modded aircraft not in vanilla result, permitted by our config
-            for (int i = 0; i < baseHangars.Count; i++)
-            {
-                var hangar = baseHangars[i];
-                if (hangar == null || !hangar.Available) continue; // CRITICAL check for occupancy/availability!
-                var modded = GetAllAllowedAircraftForHangar(hangar);
-                for (int j = 0; j < modded.Length; j++)
+                // Add modded aircraft not in vanilla result, permitted by our config
+                for (int i = 0; i < baseHangars.Count; i++)
                 {
-                    allowedSet.Add(modded[j]);
+                    var hangar = baseHangars[i];
+                    if (hangar == null || !hangar.Available) continue; // CRITICAL check for occupancy/availability!
+                    var modded = GetAllAllowedAircraftForHangar(hangar);
+                    for (int j = 0; j < modded.Length; j++)
+                    {
+                        allowedSet.Add(modded[j]);
+                    }
                 }
+                __result = allowedSet.ToList();
             }
-            __result = allowedSet.ToList();
+            catch (Exception ex)
+            {
+                Log.LogError($"Exception in Airbase_GetAvailableAircraft_Postfix: {ex}");
+            }
         }
     }
 }
